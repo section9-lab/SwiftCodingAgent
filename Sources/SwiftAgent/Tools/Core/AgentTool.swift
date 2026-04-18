@@ -2,11 +2,32 @@ import Foundation
 
 public struct ToolExecutionContext: Sendable {
     public let workingDirectory: URL
-    public let allowedRoots: [URL]
+    public let executionPolicy: ToolExecutionPolicy
 
-    public init(workingDirectory: URL, allowedRoots: [URL]? = nil) {
+    public var allowedRoots: [URL] {
+        executionPolicy.fileAccess.allowedRoots
+    }
+
+    public var bashExecutionPolicy: BashExecutionPolicy {
+        executionPolicy.bash
+    }
+
+    public init(
+        workingDirectory: URL,
+        allowedRoots: [URL]? = nil,
+        bashExecutionPolicy: BashExecutionPolicy = .sandboxed(.init())
+    ) {
         self.workingDirectory = workingDirectory
-        self.allowedRoots = allowedRoots?.isEmpty == false ? allowedRoots! : [workingDirectory]
+        self.executionPolicy = ToolExecutionPolicy(
+            workingDirectory: workingDirectory,
+            allowedRoots: allowedRoots ?? [],
+            bash: bashExecutionPolicy
+        )
+    }
+
+    public init(workingDirectory: URL, executionPolicy: ToolExecutionPolicy) {
+        self.workingDirectory = workingDirectory
+        self.executionPolicy = executionPolicy
     }
 }
 

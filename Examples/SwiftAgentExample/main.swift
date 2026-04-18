@@ -14,6 +14,10 @@ struct SwiftAgentExample {
         let agent = AgentSDK(
             model: model,
             workingDirectory: workingDir,
+            executionPolicy: ToolExecutionPolicy(
+                workingDirectory: workingDir,
+                bash: .disabled
+            ),
             maxSteps: 5
         )
         

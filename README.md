@@ -41,6 +41,11 @@ let openAI = OpenAICompatibleChatModel(
 let agent = AgentSDK(
     model: openAI,
     workingDirectory: URL(fileURLWithPath: "/path/to/workspace"),
+    executionPolicy: ToolExecutionPolicy(
+        workingDirectory: URL(fileURLWithPath: "/path/to/workspace"),
+        allowedRoots: [URL(fileURLWithPath: "/path/to/shared")],
+        bash: .disabled
+    ),
     maxSteps: 10
 )
 
@@ -56,7 +61,25 @@ print(result.finalText)
 - `ReadTool` - Read text files
 - `WriteTool` - Write/create files
 - `EditTool` - Find and replace in files
-- `BashTool` - Execute shell commands (sandboxed)
+- `BashTool` - Execute shell commands using an explicit execution policy
+
+### Execution Policy
+
+`read`, `write`, and `edit` always respect the configured file roots. `bash` is configured separately so apps can disable it, run it in a constrained sandbox, or allow unrestricted execution.
+
+```swift
+let policy = ToolExecutionPolicy(
+    workingDirectory: workspaceURL,
+    allowedRoots: [workspaceURL, sharedToolsURL],
+    bash: .sandboxed(.init())
+)
+
+let agent = AgentSDK(
+    model: model,
+    workingDirectory: workspaceURL,
+    executionPolicy: policy
+)
+```
 
 ### Custom Tools
 

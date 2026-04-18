@@ -26,6 +26,39 @@ private struct MockModel: AgentModel {
 
 struct AgentLoopTests {
     @Test
+    func executionPolicyIncludesWorkingDirectoryInAllowedRoots() {
+        let workingDirectory = URL(fileURLWithPath: "/tmp/workspace")
+        let policy = ToolExecutionPolicy(
+            workingDirectory: workingDirectory,
+            allowedRoots: [
+                URL(fileURLWithPath: "/tmp/workspace"),
+                URL(fileURLWithPath: "/tmp/shared")
+            ]
+        )
+
+        #expect(policy.fileAccess.allowedRoots.map(\.path) == ["/tmp/workspace", "/tmp/shared"])
+    }
+
+    @Test
+    func bashCanBeDisabledByPolicy() async throws {
+        let tool = BashTool()
+        let context = ToolExecutionContext(
+            workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+            executionPolicy: ToolExecutionPolicy(
+                workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+                bash: .disabled
+            )
+        )
+
+        await #expect(throws: ToolError.self) {
+            try await tool.run(
+                argumentsJSON: #"{"command":"pwd"}"#,
+                context: context
+            )
+        }
+    }
+
+    @Test
     func finalTextWithoutTool() async throws {
         let model = MockModel(responses: [ModelResponse(content: "hello")])
         let loop = AgentLoop(

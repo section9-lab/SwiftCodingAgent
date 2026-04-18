@@ -3,18 +3,26 @@ import Foundation
 public struct AgentLoopConfig: Sendable {
     public let maxSteps: Int
     public let workingDirectory: URL
-    public let allowedRoots: [URL]
+    public let executionPolicy: ToolExecutionPolicy
     public let compaction: CompactionConfig
+
+    public var allowedRoots: [URL] {
+        executionPolicy.fileAccess.allowedRoots
+    }
 
     public init(
         maxSteps: Int = 8,
         workingDirectory: URL,
         allowedRoots: [URL] = [],
+        executionPolicy: ToolExecutionPolicy? = nil,
         compaction: CompactionConfig = .init()
     ) {
         self.maxSteps = maxSteps
         self.workingDirectory = workingDirectory
-        self.allowedRoots = allowedRoots
+        self.executionPolicy = executionPolicy ?? ToolExecutionPolicy(
+            workingDirectory: workingDirectory,
+            allowedRoots: allowedRoots
+        )
         self.compaction = compaction
     }
 }
@@ -117,8 +125,10 @@ public actor AgentLoop {
                 )
             }
 
-            let roots = config.allowedRoots.isEmpty ? [config.workingDirectory] : config.allowedRoots
-            let context = ToolExecutionContext(workingDirectory: config.workingDirectory, allowedRoots: roots)
+            let context = ToolExecutionContext(
+                workingDirectory: config.workingDirectory,
+                executionPolicy: config.executionPolicy
+            )
             for call in response.toolCalls {
                 messages.append(
                     AgentMessage(
