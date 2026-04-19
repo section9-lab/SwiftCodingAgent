@@ -1,5 +1,5 @@
 import Testing
-@testable import SwiftAgent
+@testable import SwiftCodingAgent
 import Foundation
 
 private actor MockState {

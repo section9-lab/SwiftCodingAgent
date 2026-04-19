@@ -1,10 +1,10 @@
-import SwiftAgent
+import SwiftCodingAgent
 import Foundation
 
 @main
-struct SwiftAgentExample {
+struct SwiftCodingAgentExample {
     static func main() async throws {
-        print("=== SwiftAgent Example ===\n")
+        print("=== SwiftCodingAgent Example ===\n")
         
         // 使用 EchoModel（不需要 API key）
         let model = EchoModel()
@@ -22,8 +22,8 @@ struct SwiftAgentExample {
         )
         
         // 运行 agent
-        print("User: Hello, SwiftAgent!")
-        let result = try await agent.run(prompt: "Hello, SwiftAgent!")
+        print("User: Hello, SwiftCodingAgent!")
+        let result = try await agent.run(prompt: "Hello, SwiftCodingAgent!")
         print("Agent: \(result.finalText)")
         print("\nSteps: \(result.steps)")
         

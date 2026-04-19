@@ -2,29 +2,29 @@
 import PackageDescription
 
 let package = Package(
-    name: "SwiftAgent",
+    name: "SwiftCodingAgent",
     platforms: [
         .macOS(.v13),
         .iOS(.v17)
     ],
     products: [
-        .library(name: "SwiftAgent", targets: ["SwiftAgent"]),
-        .executable(name: "SwiftAgentExample", targets: ["SwiftAgentExample"])
+        .library(name: "SwiftCodingAgent", targets: ["SwiftCodingAgent"]),
+        .executable(name: "SwiftCodingAgentExample", targets: ["SwiftCodingAgentExample"])
     ],
     targets: [
         .target(
-            name: "SwiftAgent",
-            path: "Sources/SwiftAgent"
+            name: "SwiftCodingAgent",
+            path: "Sources/SwiftCodingAgent"
         ),
         .testTarget(
-            name: "SwiftAgentTests",
-            dependencies: ["SwiftAgent"],
-            path: "Tests/SwiftAgentTests"
+            name: "SwiftCodingAgentTests",
+            dependencies: ["SwiftCodingAgent"],
+            path: "Tests/SwiftCodingAgentTests"
         ),
         .executableTarget(
-            name: "SwiftAgentExample",
-            dependencies: ["SwiftAgent"],
-            path: "Examples/SwiftAgentExample"
+            name: "SwiftCodingAgentExample",
+            dependencies: ["SwiftCodingAgent"],
+            path: "Examples/SwiftCodingAgentExample"
         )
     ]
 )
