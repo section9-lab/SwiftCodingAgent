@@ -12,8 +12,7 @@ It is designed for apps that need real agent behavior instead of a thin chat wra
 
 [![GitHub Star](https://img.shields.io/github/stars/section9-lab/SwiftCodingAgent?style=rounded&color=white&labelColor=000000)](https://github.com/section9-lab/SwiftCodingAgent/stargazers)
 [![GitHub license](https://img.shields.io/github/license/section9-lab/SwiftCodingAgent?style=rounded&color=white&labelColor=000000)](LICENSE)
-[![Release Version](https://img.shields.io/github/v/release/section9-lab/SwiftCodingAgent?style=rounded&color=white&labelColor=000000)](https://github.com/section9-lab/SwiftCodingAgent/releases/latest)
-![GitHub Repo size](https://img.shields.io/github/repo-size/section9-lab/SwiftCodingAgent?style=rounded&color=white&labelColor=000000&label=dmg%20size)
+
 </div>
 
 ## Why SwiftCodingAgent
