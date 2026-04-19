@@ -10,6 +10,7 @@ public actor AgentSDK {
         workingDirectory: URL,
         allowedRoots: [URL] = [],
         executionPolicy: ToolExecutionPolicy? = nil,
+        toolExecutionContexts: [String: ToolExecutionContext] = [:],
         maxSteps: Int = 8,
         compaction: CompactionConfig = .init(),
         skillsDirectories: [URL] = []
@@ -35,6 +36,7 @@ public actor AgentSDK {
                 workingDirectory: workingDirectory,
                 allowedRoots: allowedRoots,
                 executionPolicy: executionPolicy,
+                toolExecutionContexts: toolExecutionContexts,
                 compaction: compaction
             )
         )

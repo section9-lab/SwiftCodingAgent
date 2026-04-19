@@ -3,8 +3,12 @@ import Foundation
 public struct FileAccessPolicy: Sendable {
     public let allowedRoots: [URL]
 
+    public init(allowedRoots: [URL] = []) {
+        self.allowedRoots = Self.normalizeRoots(allowedRoots)
+    }
+
     public init(workingDirectory: URL, allowedRoots: [URL] = []) {
-        self.allowedRoots = Self.normalizeRoots([workingDirectory] + allowedRoots)
+        self.init(allowedRoots: [workingDirectory] + allowedRoots)
     }
 
     private static func normalizeRoots(_ roots: [URL]) -> [URL] {
@@ -40,6 +44,16 @@ public enum BashExecutionPolicy: Sendable {
 public struct ToolExecutionPolicy: Sendable {
     public let fileAccess: FileAccessPolicy
     public let bash: BashExecutionPolicy
+
+    public init(
+        allowedRoots: [URL] = [],
+        bash: BashExecutionPolicy = .sandboxed(.init())
+    ) {
+        self.init(
+            fileAccess: FileAccessPolicy(allowedRoots: allowedRoots),
+            bash: bash
+        )
+    }
 
     public init(
         workingDirectory: URL,

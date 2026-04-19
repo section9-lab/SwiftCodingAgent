@@ -4,6 +4,7 @@ public struct AgentLoopConfig: Sendable {
     public let maxSteps: Int
     public let workingDirectory: URL
     public let executionPolicy: ToolExecutionPolicy
+    public let toolExecutionContexts: [String: ToolExecutionContext]
     public let compaction: CompactionConfig
 
     public var allowedRoots: [URL] {
@@ -15,15 +16,24 @@ public struct AgentLoopConfig: Sendable {
         workingDirectory: URL,
         allowedRoots: [URL] = [],
         executionPolicy: ToolExecutionPolicy? = nil,
+        toolExecutionContexts: [String: ToolExecutionContext] = [:],
         compaction: CompactionConfig = .init()
     ) {
         self.maxSteps = maxSteps
         self.workingDirectory = workingDirectory
+        let effectiveRoots = allowedRoots.isEmpty ? [workingDirectory] : allowedRoots
         self.executionPolicy = executionPolicy ?? ToolExecutionPolicy(
-            workingDirectory: workingDirectory,
-            allowedRoots: allowedRoots
+            allowedRoots: effectiveRoots
         )
+        self.toolExecutionContexts = toolExecutionContexts
         self.compaction = compaction
+    }
+
+    public func context(for toolName: String) -> ToolExecutionContext {
+        toolExecutionContexts[toolName] ?? ToolExecutionContext(
+            workingDirectory: workingDirectory,
+            executionPolicy: executionPolicy
+        )
     }
 }
 
@@ -125,11 +135,8 @@ public actor AgentLoop {
                 )
             }
 
-            let context = ToolExecutionContext(
-                workingDirectory: config.workingDirectory,
-                executionPolicy: config.executionPolicy
-            )
             for call in response.toolCalls {
+                let context = config.context(for: call.name)
                 messages.append(
                     AgentMessage(
                         role: .assistant,

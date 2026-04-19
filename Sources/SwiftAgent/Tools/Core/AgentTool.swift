@@ -18,9 +18,10 @@ public struct ToolExecutionContext: Sendable {
         bashExecutionPolicy: BashExecutionPolicy = .sandboxed(.init())
     ) {
         self.workingDirectory = workingDirectory
+        let explicitRoots = allowedRoots ?? []
+        let effectiveRoots = explicitRoots.isEmpty ? [workingDirectory] : explicitRoots
         self.executionPolicy = ToolExecutionPolicy(
-            workingDirectory: workingDirectory,
-            allowedRoots: allowedRoots ?? [],
+            allowedRoots: effectiveRoots,
             bash: bashExecutionPolicy
         )
     }

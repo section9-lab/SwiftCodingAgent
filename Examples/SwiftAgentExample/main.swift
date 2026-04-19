@@ -15,7 +15,7 @@ struct SwiftAgentExample {
             model: model,
             workingDirectory: workingDir,
             executionPolicy: ToolExecutionPolicy(
-                workingDirectory: workingDir,
+                allowedRoots: [workingDir],
                 bash: .disabled
             ),
             maxSteps: 5
