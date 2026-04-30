@@ -20,6 +20,7 @@ public struct BashTool: AgentTool {
         }
 
         let args = try JSONDecoder.toolDecoder.decode(Args.self, from: data)
+        try await requestApprovalIfNeeded(for: args.command, context: context)
         return try runCommand(
             args.command,
             cwd: context.workingDirectory,
@@ -145,5 +146,158 @@ public struct BashTool: AgentTool {
         path
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private func requestApprovalIfNeeded(for command: String, context: ToolExecutionContext) async throws {
+        guard let risk = BashRiskClassifier.classify(command) else { return }
+        guard let approvalHandler = context.approvalHandler else {
+            throw ToolError.commandFailed("User approval required before running this command: \(risk.reason)")
+        }
+
+        let decision = await approvalHandler(
+            ToolApprovalRequest(
+                toolName: name,
+                summary: command,
+                reason: risk.reason
+            )
+        )
+
+        switch decision {
+        case .approved:
+            return
+        case .rejected:
+            throw ToolError.commandFailed("User rejected command: \(command)")
+        }
+    }
+}
+
+private enum BashRiskClassifier {
+    struct Risk {
+        let reason: String
+    }
+
+    static func classify(_ command: String) -> Risk? {
+        let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+
+        let lower = normalized.lowercased()
+
+        if containsRemoteScriptExecution(lower) {
+            return Risk(reason: "This command downloads and executes remote code.")
+        }
+
+        if containsSensitiveRead(lower) {
+            return Risk(reason: "This command may read credentials, tokens, or private keys.")
+        }
+
+        if containsDestructiveFileOperation(lower) {
+            return Risk(reason: "This command may delete, overwrite, or recursively change files.")
+        }
+
+        if containsDangerousGitOperation(lower) {
+            return Risk(reason: "This command can discard history, remove files, or rewrite remote branches.")
+        }
+
+        if lower.contains("sudo") || writesSystemPath(lower) {
+            return Risk(reason: "This command may modify system-level files or privileges.")
+        }
+
+        if sendsLocalFileOverNetwork(lower) {
+            return Risk(reason: "This command may upload local files or project data over the network.")
+        }
+
+        return nil
+    }
+
+    private static func containsRemoteScriptExecution(_ command: String) -> Bool {
+        let hasDownloader = command.contains("curl ") || command.contains("wget ")
+        let pipesToShell = command.contains("| sh") || command.contains("| bash") || command.contains("| zsh")
+        return hasDownloader && pipesToShell
+    }
+
+    private static func containsSensitiveRead(_ command: String) -> Bool {
+        let sensitivePatterns = [
+            ".env",
+            "id_rsa",
+            "id_ed25519",
+            ".ssh/",
+            "token",
+            "secret",
+            "keychain",
+            "login.keychain",
+            "cookies.sqlite",
+            "history/login data"
+        ]
+
+        return sensitivePatterns.contains { command.contains($0) }
+    }
+
+    private static func containsDestructiveFileOperation(_ command: String) -> Bool {
+        let destructivePatterns = [
+            "rm ",
+            "rm\t",
+            "rm -",
+            "rm -rf",
+            "rm -fr",
+            " -delete",
+            "trash ",
+            "shred ",
+            "chmod -r",
+            "chown -r",
+            "cp -f"
+        ]
+
+        if command.contains("find ") && command.contains(" -delete") {
+            return true
+        }
+
+        return destructivePatterns.contains { command.contains($0) }
+    }
+
+    private static func containsDangerousGitOperation(_ command: String) -> Bool {
+        let gitPatterns = [
+            "git reset --hard",
+            "git clean",
+            "git push --force",
+            "git push -f",
+            "git branch -d",
+            "git branch -D",
+            "git tag -d",
+            "git checkout --",
+            "git restore "
+        ]
+
+        return gitPatterns.contains { command.contains($0.lowercased()) }
+    }
+
+    private static func writesSystemPath(_ command: String) -> Bool {
+        let systemPaths = [
+            " /system/",
+            " /usr/",
+            " /bin/",
+            " /sbin/",
+            " /etc/",
+            " /library/",
+            ">/system/",
+            ">/usr/",
+            ">/bin/",
+            ">/sbin/",
+            ">/etc/",
+            ">/library/"
+        ]
+
+        return systemPaths.contains { command.contains($0) }
+    }
+
+    private static func sendsLocalFileOverNetwork(_ command: String) -> Bool {
+        guard command.contains("curl ") || command.contains("wget ") || command.contains("scp ") || command.contains("rsync ") else {
+            return false
+        }
+
+        return command.contains("-f ") ||
+            command.contains("--form") ||
+            command.contains("--data-binary") ||
+            command.contains("@/") ||
+            command.contains("@.")
     }
 }

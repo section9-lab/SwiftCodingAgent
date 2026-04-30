@@ -1,23 +1,25 @@
 import Foundation
 
 public struct AgentLoopConfig: Sendable {
-    public let maxSteps: Int
+    public let maxSteps: Int?
     public let workingDirectory: URL
     public let executionPolicy: ToolExecutionPolicy
     public let toolExecutionContexts: [String: ToolExecutionContext]
     public let compaction: CompactionConfig
+    public let approvalHandler: ToolApprovalHandler?
 
     public var allowedRoots: [URL] {
         executionPolicy.fileAccess.allowedRoots
     }
 
     public init(
-        maxSteps: Int = 8,
+        maxSteps: Int? = 8,
         workingDirectory: URL,
         allowedRoots: [URL] = [],
         executionPolicy: ToolExecutionPolicy? = nil,
         toolExecutionContexts: [String: ToolExecutionContext] = [:],
-        compaction: CompactionConfig = .init()
+        compaction: CompactionConfig = .init(),
+        approvalHandler: ToolApprovalHandler? = nil
     ) {
         self.maxSteps = maxSteps
         self.workingDirectory = workingDirectory
@@ -27,13 +29,15 @@ public struct AgentLoopConfig: Sendable {
         )
         self.toolExecutionContexts = toolExecutionContexts
         self.compaction = compaction
+        self.approvalHandler = approvalHandler
     }
 
     public func context(for toolName: String) -> ToolExecutionContext {
-        toolExecutionContexts[toolName] ?? ToolExecutionContext(
+        let context = toolExecutionContexts[toolName] ?? ToolExecutionContext(
             workingDirectory: workingDirectory,
             executionPolicy: executionPolicy
         )
+        return context.withApprovalHandler(approvalHandler)
     }
 }
 
@@ -108,11 +112,28 @@ public actor AgentLoop {
         compactionSummary
     }
 
+    /// Snapshot of how much of the model context window is currently in use,
+    /// based on the same heuristic the auto-compactor uses.
+    public func contextUsage() -> ContextUsage {
+        let requestMessages = makeRequestMessages()
+        let used = estimateTokens(messages: requestMessages)
+        return ContextUsage(
+            usedTokens: used,
+            totalTokens: config.compaction.modelContextWindow,
+            reservedTokens: config.compaction.reserveTokens
+        )
+    }
+
     @discardableResult
     public func run(userInput: String) async throws -> AgentRunResult {
         messages.append(AgentMessage(role: .user, content: userInput))
 
-        for step in 1...config.maxSteps {
+        var step = 0
+
+        while config.maxSteps.map({ step < $0 }) ?? true {
+            try Task.checkCancellation()
+            step += 1
+
             try await maybeCompact()
 
             let request = ModelRequest(

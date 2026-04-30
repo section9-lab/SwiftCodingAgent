@@ -11,9 +11,10 @@ public actor AgentSDK {
         allowedRoots: [URL] = [],
         executionPolicy: ToolExecutionPolicy? = nil,
         toolExecutionContexts: [String: ToolExecutionContext] = [:],
-        maxSteps: Int = 8,
+        maxSteps: Int? = 8,
         compaction: CompactionConfig = .init(),
-        skillsDirectories: [URL] = []
+        skillsDirectories: [URL] = [],
+        approvalHandler: ToolApprovalHandler? = nil
     ) {
         let builtinTools: [any AgentTool] = [
             ReadTool(),
@@ -37,7 +38,8 @@ public actor AgentSDK {
                 allowedRoots: allowedRoots,
                 executionPolicy: executionPolicy,
                 toolExecutionContexts: toolExecutionContexts,
-                compaction: compaction
+                compaction: compaction,
+                approvalHandler: approvalHandler
             )
         )
     }
@@ -56,5 +58,9 @@ public actor AgentSDK {
 
     public func compact(customInstructions: String? = nil) async throws -> String? {
         try await loop.compact(customInstructions: customInstructions)
+    }
+
+    public func contextUsage() async -> ContextUsage {
+        await loop.contextUsage()
     }
 }

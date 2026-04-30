@@ -3,6 +3,7 @@ import Foundation
 public struct ToolExecutionContext: Sendable {
     public let workingDirectory: URL
     public let executionPolicy: ToolExecutionPolicy
+    public let approvalHandler: ToolApprovalHandler?
 
     public var allowedRoots: [URL] {
         executionPolicy.fileAccess.allowedRoots
@@ -15,9 +16,11 @@ public struct ToolExecutionContext: Sendable {
     public init(
         workingDirectory: URL,
         allowedRoots: [URL]? = nil,
-        bashExecutionPolicy: BashExecutionPolicy = .sandboxed(.init())
+        bashExecutionPolicy: BashExecutionPolicy = .sandboxed(.init()),
+        approvalHandler: ToolApprovalHandler? = nil
     ) {
         self.workingDirectory = workingDirectory
+        self.approvalHandler = approvalHandler
         let explicitRoots = allowedRoots ?? []
         let effectiveRoots = explicitRoots.isEmpty ? [workingDirectory] : explicitRoots
         self.executionPolicy = ToolExecutionPolicy(
@@ -26,11 +29,50 @@ public struct ToolExecutionContext: Sendable {
         )
     }
 
-    public init(workingDirectory: URL, executionPolicy: ToolExecutionPolicy) {
+    public init(
+        workingDirectory: URL,
+        executionPolicy: ToolExecutionPolicy,
+        approvalHandler: ToolApprovalHandler? = nil
+    ) {
         self.workingDirectory = workingDirectory
         self.executionPolicy = executionPolicy
+        self.approvalHandler = approvalHandler
+    }
+
+    public func withApprovalHandler(_ approvalHandler: ToolApprovalHandler?) -> ToolExecutionContext {
+        ToolExecutionContext(
+            workingDirectory: workingDirectory,
+            executionPolicy: executionPolicy,
+            approvalHandler: approvalHandler ?? self.approvalHandler
+        )
     }
 }
+
+public enum ToolApprovalDecision: Sendable {
+    case approved
+    case rejected
+}
+
+public struct ToolApprovalRequest: Identifiable, Sendable {
+    public let id: UUID
+    public let toolName: String
+    public let summary: String
+    public let reason: String
+
+    public init(
+        id: UUID = UUID(),
+        toolName: String,
+        summary: String,
+        reason: String
+    ) {
+        self.id = id
+        self.toolName = toolName
+        self.summary = summary
+        self.reason = reason
+    }
+}
+
+public typealias ToolApprovalHandler = @Sendable (ToolApprovalRequest) async -> ToolApprovalDecision
 
 public protocol AgentTool: Sendable {
     var name: String { get }
