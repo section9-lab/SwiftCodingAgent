@@ -133,6 +133,13 @@ public enum ModelStreamEvent: Sendable {
     /// Incremental text fragment from the assistant. Concatenate to build the
     /// full text.
     case textDelta(String)
+    /// Incremental fragment of model "reasoning" / chain-of-thought. Some
+    /// providers (NVIDIA NIM with GPT-OSS / DeepSeek-R1, Qwen-Thinking,
+    /// upstream OpenAI o1-style endpoints) put this in a separate
+    /// `reasoning_content` field — adapters surface those fragments here so
+    /// callers can choose to display them in a collapsed/dimmed UI without
+    /// mixing with the final answer.
+    case reasoningDelta(String)
     /// A fully-assembled tool call. Emitted once the adapter has the complete
     /// arguments JSON.
     case toolCall(ToolCall)

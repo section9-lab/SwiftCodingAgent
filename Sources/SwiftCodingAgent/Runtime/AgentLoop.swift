@@ -72,6 +72,13 @@ public enum AgentEvent: Sendable {
     /// Incremental assistant text from the current step. Concatenate to build
     /// the full text for that step.
     case textDelta(String)
+    /// Incremental fragment of model "reasoning" / chain-of-thought (sourced
+    /// from `reasoning_content` on OpenAI-style streams, or comparable
+    /// channels on other providers). Forwarded as a separate event so callers
+    /// can render it in a collapsed/dimmed pane without mixing it into the
+    /// final answer. Reasoning is *not* persisted into the assistant message
+    /// — it only exists during the live stream.
+    case reasoningDelta(String)
     /// The assistant turn finished. `text` is the full assembled text for the
     /// step; `toolCalls` is empty if no tools were requested.
     case assistantTurn(text: String, toolCalls: [ToolCall])
@@ -97,25 +104,41 @@ public enum AgentLoopError: LocalizedError {
 public actor AgentLoop {
     private struct CutPoint {
         let index: Int
-        let isSplitTurn: Bool
     }
 
     private let model: any AgentModel
+    /// Model used to summarise older history. Defaults to `model` if no
+    /// dedicated summariser was provided (a smaller / cheaper model is often a
+    /// good fit for this — see AgentSDK's `summarizerModel` parameter).
+    private let summarizer: any AgentModel
     private let toolRegistry: ToolRegistry
     private let config: AgentLoopConfig
     private var messages: [AgentMessage]
 
-    private let immutablePrefixCount: Int
+    /// Messages in the [0..<immutablePrefixCount] range are never compacted
+    /// and are sent verbatim on every request. Initially this covers skill
+    /// system prompts; once the user sends their first message it grows to
+    /// include that message too, so the original goal stays as an anchor.
+    private var immutablePrefixCount: Int
     private var firstKeptMessageIndex: Int
     private var compactionSummary: String?
+    private var firstUserMessageAnchored = false
+    /// Last input-token count reported by the model. We trust this over any
+    /// estimator: it's exact, post-cache, and matches what the provider bills.
+    private var lastReportedInputTokens: Int?
+    /// Counts consecutive failed compaction attempts. After enough failures
+    /// we force-drop the oldest turn instead of looping forever.
+    private var consecutiveCompactionFailures = 0
 
     public init(
         model: any AgentModel,
+        summarizerModel: (any AgentModel)? = nil,
         skills: [any AgentSkill] = [],
         tools: [any AgentTool] = [],
         config: AgentLoopConfig
     ) {
         self.model = model
+        self.summarizer = summarizerModel ?? model
         self.config = config
 
         let skillTools = skills.flatMap { $0.tools }
@@ -154,7 +177,7 @@ public actor AgentLoop {
 
     @discardableResult
     public func run(userInput: String) async throws -> AgentRunResult {
-        messages.append(.user(userInput))
+        appendUserInput(userInput)
 
         var step = 0
 
@@ -170,6 +193,7 @@ public actor AgentLoop {
             )
 
             let response = try await model.generate(request: request)
+            recordUsage(response.usage)
 
             // Persist the assistant turn as a single message carrying both the
             // textual response and any tool calls. This matches both OpenAI's
@@ -230,7 +254,7 @@ public actor AgentLoop {
         userInput: String,
         continuation: AsyncThrowingStream<AgentEvent, Error>.Continuation
     ) async throws {
-        messages.append(.user(userInput))
+        appendUserInput(userInput)
 
         var step = 0
 
@@ -256,6 +280,10 @@ public actor AgentLoop {
                 case .textDelta(let delta):
                     stepText += delta
                     continuation.yield(.textDelta(delta))
+                case .reasoningDelta(let delta):
+                    // Reasoning is forwarded but not folded into the
+                    // persisted assistant message — it's transient UI state.
+                    continuation.yield(.reasoningDelta(delta))
                 case .toolCall(let call):
                     stepToolCalls.append(call)
                 case .completed(let response):
@@ -263,6 +291,7 @@ public actor AgentLoop {
                     // surface text only here. Take whichever is non-empty.
                     if stepText.isEmpty { stepText = response.content }
                     if stepToolCalls.isEmpty { stepToolCalls = response.toolCalls }
+                    recordUsage(response.usage)
                 }
             }
 
@@ -363,6 +392,24 @@ public actor AgentLoop {
         }
     }
 
+    private func appendUserInput(_ text: String) {
+        messages.append(.user(text))
+        // Anchor the user's first message into the immutable prefix so the
+        // original task description is never compacted away. This mirrors
+        // pi-coding-agent's `firstKeptEntryId` anchor: subsequent compactions
+        // operate strictly on messages after this point.
+        if !firstUserMessageAnchored {
+            firstUserMessageAnchored = true
+            immutablePrefixCount = messages.count
+            firstKeptMessageIndex = messages.count
+        }
+    }
+
+    private func recordUsage(_ usage: ModelUsage?) {
+        guard let usage, let input = usage.inputTokens else { return }
+        lastReportedInputTokens = input
+    }
+
     private func maybeCompact() async throws {
         _ = try await compactIfNeeded(force: false, customInstructions: nil)
     }
@@ -377,58 +424,158 @@ public actor AgentLoop {
         guard cfg.enabled || force else { return false }
 
         if !force {
-            let requestMessages = makeRequestMessages()
-            let estimatedTokens = estimateTokens(messages: requestMessages)
+            let used = currentUsedTokens()
             let threshold = max(1_024, cfg.modelContextWindow - cfg.reserveTokens)
-            guard estimatedTokens > threshold else { return false }
+            guard used > threshold else { return false }
         }
 
         guard let cutPoint = findCutPoint(keepRecentTokens: cfg.keepRecentTokens),
               cutPoint.index > firstKeptMessageIndex,
               cutPoint.index - firstKeptMessageIndex >= cfg.minMessagesToCompact
         else {
-            return false
+            // No safe cut available — usually means the recent tail itself
+            // exceeds keepRecentTokens. If repeated, force-drop the oldest
+            // turn so the loop can make progress instead of hammering the
+            // summariser indefinitely.
+            return await registerCompactionFailure(reason: .noCutPoint)
         }
 
         let toSummarize = Array(messages[firstKeptMessageIndex..<cutPoint.index])
         let serialized = serializeForSummary(messages: toSummarize)
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        guard !serialized.isEmpty else { return false }
+        guard !serialized.isEmpty else {
+            return await registerCompactionFailure(reason: .emptyContent)
+        }
 
         let summaryPrompt = makeCompactionPrompt(
             serializedConversation: serialized,
-            customInstructions: customInstructions,
-            isSplitTurn: cutPoint.isSplitTurn
+            customInstructions: customInstructions
         )
-        let result = try await model.generate(
-            request: ModelRequest(
-                messages: [.user(summaryPrompt)],
-                tools: []
+
+        let newSummary: String
+        do {
+            let result = try await summarizer.generate(
+                request: ModelRequest(
+                    messages: [.user(summaryPrompt)],
+                    tools: []
+                )
             )
+            newSummary = result.content.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        } catch {
+            return await registerCompactionFailure(reason: .summarizerError)
+        }
+
+        guard !newSummary.isEmpty else {
+            return await registerCompactionFailure(reason: .emptySummary)
+        }
+
+        // Merge with the previous summary. If the combined length blows past
+        // the configured threshold, ask the summariser to consolidate the two
+        // into a single tighter summary instead of doing a character-suffix
+        // truncate (which would silently lose the older anchor).
+        let consolidated = try await consolidateSummaryIfNeeded(
+            old: compactionSummary,
+            new: newSummary,
+            threshold: cfg.summaryConsolidateThreshold
         )
 
-        let newSummary = result.content.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        guard !newSummary.isEmpty else { return false }
-
-        // Compute the merged summary first, then commit both pieces of state
-        // together so a failure can't leave history pruned without a summary.
-        let merged = mergeSummary(old: compactionSummary, new: newSummary, maxChars: cfg.maxSummaryChars)
-        compactionSummary = merged
+        compactionSummary = consolidated
         firstKeptMessageIndex = cutPoint.index
+        consecutiveCompactionFailures = 0
         return true
+    }
+
+    private enum CompactionFailureReason {
+        case noCutPoint, emptyContent, emptySummary, summarizerError
+    }
+
+    /// Track repeated compaction failures and, after enough of them, drop the
+    /// oldest turn with a placeholder so the conversation can keep moving.
+    private func registerCompactionFailure(reason: CompactionFailureReason) async -> Bool {
+        consecutiveCompactionFailures += 1
+        guard consecutiveCompactionFailures >= config.compaction.maxConsecutiveFailures else {
+            return false
+        }
+
+        // Find the next turn boundary after firstKeptMessageIndex and discard
+        // everything up to it, replacing with a synthetic placeholder.
+        let dropTarget = nextTurnBoundary(after: firstKeptMessageIndex)
+        guard let dropTo = dropTarget, dropTo > firstKeptMessageIndex else {
+            // Nothing safe to drop. Reset counter so we don't spin.
+            consecutiveCompactionFailures = 0
+            return false
+        }
+
+        let droppedCount = dropTo - firstKeptMessageIndex
+        let placeholder = "[\(droppedCount) earlier message\(droppedCount == 1 ? "" : "s") dropped after repeated summarisation failures]"
+        compactionSummary = compactionSummary.map { $0 + "\n\n" + placeholder } ?? placeholder
+        firstKeptMessageIndex = dropTo
+        consecutiveCompactionFailures = 0
+        return true
+    }
+
+    /// First user-message index strictly greater than `start`. Used as a safe
+    /// drop target — guarantees we never split a tool_use / tool_result pair.
+    private func nextTurnBoundary(after start: Int) -> Int? {
+        var i = start + 1
+        while i < messages.count {
+            if messages[i].role == .user { return i }
+            i += 1
+        }
+        return nil
+    }
+
+    private func consolidateSummaryIfNeeded(
+        old: String?,
+        new: String,
+        threshold: Int
+    ) async throws -> String {
+        let merged = old.map { $0 + "\n\n---\n\n" + new } ?? new
+        if merged.count <= threshold { return merged }
+
+        // Ask the summariser to fold both into one tighter summary, preserving
+        // the anchor / goal / decisions explicitly. If this call fails we keep
+        // the merged form (truncating from the end as a last resort).
+        let prompt = """
+        You are consolidating two compaction summaries into one tighter summary that fits future model contexts.
+
+        Preserve every concrete fact: goal, constraints, file paths, decisions made, errors, and next steps. Drop only redundancy. Keep the same section headers as in the inputs (## Goal, ## Constraints & Preferences, ## Progress, ## Key Decisions, ## Next Steps, ## Critical Context).
+
+        Older summary:
+        \(old ?? "(none)")
+
+        Newer summary:
+        \(new)
+        """
+        do {
+            let result = try await summarizer.generate(
+                request: ModelRequest(messages: [.user(prompt)], tools: [])
+            )
+            let consolidated = result.content.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            if !consolidated.isEmpty { return consolidated }
+        } catch {
+            // Fall through to fallback truncate.
+        }
+
+        // Fallback: keep the start of the merged summary (which contains the
+        // older anchors) plus the very end (most recent), explicitly marking
+        // the gap. This is a degraded but honest result.
+        if merged.count <= threshold { return merged }
+        let head = String(merged.prefix(threshold / 2))
+        let tail = String(merged.suffix(threshold / 2))
+        return head + "\n\n[…consolidation failed; some intermediate summary detail elided…]\n\n" + tail
     }
 
     private func makeCompactionPrompt(
         serializedConversation: String,
-        customInstructions: String?,
-        isSplitTurn: Bool
+        customInstructions: String?
     ) -> String {
         config.compaction.promptBuilder(
             CompactionPromptInput(
                 serializedConversation: serializedConversation,
                 previousSummary: compactionSummary,
                 customInstructions: customInstructions,
-                isSplitTurn: isSplitTurn
+                isSplitTurn: false
             )
         )
     }
@@ -440,10 +587,16 @@ public actor AgentLoop {
             requestMessages.append(contentsOf: messages.prefix(immutablePrefixCount))
         }
 
+        // Inject the summary as a `user` message rather than `system`. Pi-style.
+        // Anthropic concatenates all `system` content into the top-level system
+        // field, which would conflate the summary with the actual system prompt
+        // and may change model behaviour. A user-role wrapper avoids that.
         if let compactionSummary,
            !compactionSummary.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty
         {
-            requestMessages.append(.system("[Compaction Summary]\n\(compactionSummary)"))
+            requestMessages.append(
+                .user("[Compaction summary of earlier conversation]\n\n\(compactionSummary)")
+            )
         }
 
         if firstKeptMessageIndex < messages.count {
@@ -457,60 +610,62 @@ public actor AgentLoop {
         await toolRegistry.allSpecs().sorted { $0.name < $1.name }
     }
 
-    private func estimateTokens(messages: [AgentMessage]) -> Int {
-        messages.reduce(0) { partial, message in
-            var size = TokenEstimator.estimate(message.text)
-            for call in message.toolCalls {
-                size += TokenEstimator.estimate(call.argumentsJSON)
-            }
-            for result in message.toolResults {
-                size += TokenEstimator.estimate(result.content)
-            }
-            return partial + size + 12
+    /// Total token weight of a single message, counting every payload field.
+    /// Used by both the trigger check and the cut-point search so the two
+    /// agree on how big the conversation is.
+    private func messageWeight(_ message: AgentMessage) -> Int {
+        var size = TokenEstimator.estimate(message.text)
+        for call in message.toolCalls {
+            size += TokenEstimator.estimate(call.argumentsJSON)
         }
+        for result in message.toolResults {
+            size += TokenEstimator.estimate(result.content)
+        }
+        return size + 12  // envelope estimate
     }
 
+    private func estimateTokens(messages: [AgentMessage]) -> Int {
+        messages.reduce(0) { $0 + messageWeight($1) }
+    }
+
+    /// Tokens currently being sent to the model. Prefer the model's own usage
+    /// reporting (exact, post-cache) over our heuristic when available.
+    private func currentUsedTokens() -> Int {
+        if let reported = lastReportedInputTokens { return reported }
+        return estimateTokens(messages: makeRequestMessages())
+    }
+
+    /// Cut points are strictly at user-message boundaries. We never split a
+    /// turn (which would orphan a `tool_use` from its `tool_result` and crash
+    /// the next request). If no boundary lies between the immutable prefix
+    /// and the recent tail, we return nil and the caller falls back to the
+    /// failure path.
     private func findCutPoint(keepRecentTokens: Int) -> CutPoint? {
         guard firstKeptMessageIndex < messages.count else { return nil }
 
+        // Walk backwards summing message weight until we have enough recent
+        // history pinned. The cut point is everything older than this.
         var acc = 0
         var idx = messages.count - 1
-
         while idx >= firstKeptMessageIndex {
-            acc += TokenEstimator.estimate(messages[idx].text) + 12
-            if acc >= keepRecentTokens {
-                break
-            }
+            acc += messageWeight(messages[idx])
+            if acc >= keepRecentTokens { break }
             idx -= 1
         }
 
-        guard idx > firstKeptMessageIndex else { return nil }
-
+        // Snap the cut to the nearest user-message boundary at or before idx.
         var candidate = idx
-        while candidate > firstKeptMessageIndex, !isValidCutPoint(messages[candidate]) {
+        while candidate > firstKeptMessageIndex, messages[candidate].role != .user {
             candidate -= 1
         }
 
-        guard candidate > firstKeptMessageIndex else { return nil }
-
-        var cut = candidate
-        while cut > firstKeptMessageIndex {
-            if messages[cut].role == .user {
-                return CutPoint(index: cut, isSplitTurn: false)
-            }
-            cut -= 1
+        guard candidate > firstKeptMessageIndex,
+              messages[candidate].role == .user
+        else {
+            return nil
         }
 
-        return CutPoint(index: candidate, isSplitTurn: true)
-    }
-
-    private func isValidCutPoint(_ message: AgentMessage) -> Bool {
-        switch message.role {
-        case .user, .assistant:
-            return true
-        case .tool, .system:
-            return false
-        }
+        return CutPoint(index: candidate)
     }
 
     private func serializeForSummary(messages: [AgentMessage]) -> String {
@@ -530,7 +685,7 @@ public actor AgentLoop {
                 }
                 return parts.joined(separator: "\n")
             case .tool:
-                let maxLen = 2_000
+                let maxLen = 4_000
                 return message.toolResults.map { result in
                     let truncated = result.content.count > maxLen
                         ? String(result.content.prefix(maxLen)) + " ...(truncated \(result.content.count - maxLen) chars)"
@@ -540,11 +695,5 @@ public actor AgentLoop {
             }
         }
         .joined(separator: "\n")
-    }
-
-    private func mergeSummary(old: String?, new: String, maxChars: Int) -> String {
-        let merged = old.map { $0 + "\n\n---\n\n" + new } ?? new
-        if merged.count <= maxChars { return merged }
-        return String(merged.suffix(maxChars))
     }
 }

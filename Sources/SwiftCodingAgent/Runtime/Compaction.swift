@@ -27,7 +27,14 @@ public struct CompactionConfig: Sendable {
     public var reserveTokens: Int
     public var keepRecentTokens: Int
     public var minMessagesToCompact: Int
-    public var maxSummaryChars: Int
+    /// When the merged summary (old + new) exceeds this character count, the
+    /// summariser is asked to consolidate the two into a single tighter
+    /// summary instead of doing a character-suffix truncate.
+    public var summaryConsolidateThreshold: Int
+    /// After this many consecutive compaction failures, the loop falls back
+    /// to dropping the oldest turn with a placeholder note. Prevents infinite
+    /// retry loops when the summariser repeatedly fails.
+    public var maxConsecutiveFailures: Int
     /// Builds the prompt sent to the model when summarising older history.
     /// Override to localise or to enforce a custom output schema.
     public var promptBuilder: CompactionPromptBuilder
@@ -38,7 +45,8 @@ public struct CompactionConfig: Sendable {
         reserveTokens: Int = 16_384,
         keepRecentTokens: Int = 20_000,
         minMessagesToCompact: Int = 8,
-        maxSummaryChars: Int = 16_000,
+        summaryConsolidateThreshold: Int = 16_000,
+        maxConsecutiveFailures: Int = 3,
         promptBuilder: @escaping CompactionPromptBuilder = CompactionConfig.defaultPromptBuilder
     ) {
         self.enabled = enabled
@@ -46,7 +54,8 @@ public struct CompactionConfig: Sendable {
         self.reserveTokens = reserveTokens
         self.keepRecentTokens = keepRecentTokens
         self.minMessagesToCompact = minMessagesToCompact
-        self.maxSummaryChars = maxSummaryChars
+        self.summaryConsolidateThreshold = summaryConsolidateThreshold
+        self.maxConsecutiveFailures = maxConsecutiveFailures
         self.promptBuilder = promptBuilder
     }
 

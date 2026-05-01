@@ -5,6 +5,7 @@ public actor AgentSDK {
 
     public init(
         model: any AgentModel,
+        summarizerModel: (any AgentModel)? = nil,
         skills: [any AgentSkill] = [],
         tools: [any AgentTool] = [],
         workingDirectory: URL,
@@ -30,6 +31,7 @@ public actor AgentSDK {
 
         self.loop = AgentLoop(
             model: model,
+            summarizerModel: summarizerModel,
             skills: allSkills,
             tools: builtinTools + tools,
             config: AgentLoopConfig(

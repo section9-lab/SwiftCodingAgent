@@ -5,17 +5,26 @@ public struct OpenAICompatibleChatModel: AgentModel {
     public let apiKey: String?
     public let modelName: String
     public let timeout: TimeInterval
+    /// Whether to send `tools` / `tool_choice` in the request payload.
+    /// Some OpenAI-compatible endpoints (NVIDIA NIM serving e.g.
+    /// `qwen2.5-coder-32b-instruct`) reject the request with HTTP 400 when
+    /// `tools` is present even with an empty array. Set this to `false` for
+    /// such models; the agent loop will still surface tools to the model
+    /// via the system prompt only.
+    public let supportsTools: Bool
 
     public init(
         baseURL: URL,
         apiKey: String?,
         modelName: String,
-        timeout: TimeInterval = 120
+        timeout: TimeInterval = 120,
+        supportsTools: Bool = true
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.modelName = modelName
         self.timeout = timeout
+        self.supportsTools = supportsTools
     }
 
     public nonisolated func generate(request: ModelRequest) async throws -> ModelResponse {
@@ -111,6 +120,16 @@ public struct OpenAICompatibleChatModel: AgentModel {
                     continuation.yield(.textDelta(textDelta))
                 }
 
+                // Reasoning models (NVIDIA NIM with GPT-OSS, DeepSeek-R1,
+                // Qwen-Thinking, OpenAI o1-style) stream their chain-of-thought
+                // in a separate `reasoning_content` field. We forward it as a
+                // distinct event so callers can present it in a collapsed pane
+                // (or hide it entirely) without it getting merged into the
+                // final answer.
+                if let reasoningDelta = delta["reasoning_content"] as? String, !reasoningDelta.isEmpty {
+                    continuation.yield(.reasoningDelta(reasoningDelta))
+                }
+
                 if let toolDeltas = delta["tool_calls"] as? [[String: Any]] {
                     for item in toolDeltas {
                         let index = (item["index"] as? Int) ?? 0
@@ -149,14 +168,20 @@ public struct OpenAICompatibleChatModel: AgentModel {
     }
 
     nonisolated func makeRequestBody(from request: ModelRequest, stream: Bool = false) throws -> Data {
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "model": modelName,
             "messages": encodeMessages(request.messages),
-            "tools": request.tools.map { toolToDictionary($0) },
-            "tool_choice": "auto",
             "temperature": 0.2,
             "stream": stream
         ]
+        // Only attach tools when both the caller has tools AND the endpoint
+        // accepts them. NVIDIA NIM (and a few self-hosted vLLM/sglang
+        // deployments) return HTTP 400 if `tools` appears for a model that
+        // wasn't trained for tool use.
+        if supportsTools && !request.tools.isEmpty {
+            payload["tools"] = request.tools.map { toolToDictionary($0) }
+            payload["tool_choice"] = "auto"
+        }
 
         return try JSONSerialization.data(withJSONObject: payload, options: [])
     }
@@ -233,7 +258,15 @@ public struct OpenAICompatibleChatModel: AgentModel {
             throw NSError(domain: "OpenAICompatibleChatModel", code: -2, userInfo: [NSLocalizedDescriptionKey: "Invalid response JSON: \(text)"])
         }
 
-        let content = (message["content"] as? String) ?? ""
+        // Reasoning models put chain-of-thought in `reasoning_content`. For
+        // the non-streaming path we have no separate channel, so:
+        //   - If `content` has the final answer, ignore reasoning_content.
+        //   - If `content` is empty, fall back to reasoning_content so the
+        //     caller doesn't see an empty response. Non-stream callers can
+        //     switch to `stream(...)` if they want the two separated.
+        let rawContent = (message["content"] as? String) ?? ""
+        let reasoning = (message["reasoning_content"] as? String) ?? ""
+        let content = rawContent.isEmpty ? reasoning : rawContent
 
         let rawToolCalls = (message["tool_calls"] as? [[String: Any]]) ?? []
         let toolCalls = rawToolCalls.compactMap { item -> ToolCall? in

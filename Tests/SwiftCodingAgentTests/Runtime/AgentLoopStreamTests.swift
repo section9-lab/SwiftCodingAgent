@@ -68,6 +68,7 @@ private struct StreamingMockModel: AgentModel {
         for event in script {
             switch event {
             case .textDelta(let s): text += s
+            case .reasoningDelta: break  // not surfaced in non-streaming response
             case .toolCall(let c): calls.append(c)
             case .completed(let r):
                 if text.isEmpty { text = r.content }
