@@ -61,6 +61,28 @@ public struct AgentRunResult: Sendable {
     }
 }
 
+/// Events surfaced while `runStream` drives the agent loop.
+///
+/// The model's text response is streamed as it arrives; everything else (tool
+/// invocations, results, step boundaries) is delivered as discrete events when
+/// the corresponding work completes.
+public enum AgentEvent: Sendable {
+    /// A new step is starting (about to call the model). 1-indexed.
+    case stepStarted(Int)
+    /// Incremental assistant text from the current step. Concatenate to build
+    /// the full text for that step.
+    case textDelta(String)
+    /// The assistant turn finished. `text` is the full assembled text for the
+    /// step; `toolCalls` is empty if no tools were requested.
+    case assistantTurn(text: String, toolCalls: [ToolCall])
+    /// A tool is about to start executing.
+    case toolStarted(ToolCall)
+    /// A tool finished executing.
+    case toolFinished(ToolResult)
+    /// The agent loop has finished. Mirrors the result `run` returns.
+    case completed(AgentRunResult)
+}
+
 public enum AgentLoopError: LocalizedError {
     case maxStepsReached
 
@@ -177,6 +199,101 @@ public actor AgentLoop {
             // travel together, mirroring Anthropic's "tool_result blocks in one
             // user turn" expectation. The OpenAI adapter splits this back into
             // individual tool messages on the wire.
+            messages.append(
+                AgentMessage(role: .tool, toolResults: results)
+            )
+        }
+
+        throw AgentLoopError.maxStepsReached
+    }
+
+    /// Streamed variant of `run`.
+    ///
+    /// AI text is delivered incrementally as `.textDelta` events while it
+    /// arrives over the wire. Tool calls and tool results are delivered as
+    /// complete units (no partial JSON) — tools themselves run in batches as
+    /// before. Terminates with `.completed(AgentRunResult)` or by throwing.
+    public nonisolated func runStream(userInput: String) -> AsyncThrowingStream<AgentEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await self.driveStream(userInput: userInput, continuation: continuation)
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func driveStream(
+        userInput: String,
+        continuation: AsyncThrowingStream<AgentEvent, Error>.Continuation
+    ) async throws {
+        messages.append(.user(userInput))
+
+        var step = 0
+
+        while config.maxSteps.map({ step < $0 }) ?? true {
+            try Task.checkCancellation()
+            step += 1
+            continuation.yield(.stepStarted(step))
+
+            try await maybeCompact()
+
+            let request = ModelRequest(
+                messages: makeRequestMessages(),
+                tools: await makeRequestTools()
+            )
+
+            // Drive the model's stream and forward text deltas verbatim. Tool
+            // calls are buffered by the adapter and arrive as whole objects.
+            var stepText = ""
+            var stepToolCalls: [ToolCall] = []
+
+            for try await event in model.stream(request: request) {
+                switch event {
+                case .textDelta(let delta):
+                    stepText += delta
+                    continuation.yield(.textDelta(delta))
+                case .toolCall(let call):
+                    stepToolCalls.append(call)
+                case .completed(let response):
+                    // Adapters that fall back to non-streaming `generate` will
+                    // surface text only here. Take whichever is non-empty.
+                    if stepText.isEmpty { stepText = response.content }
+                    if stepToolCalls.isEmpty { stepToolCalls = response.toolCalls }
+                }
+            }
+
+            if !stepText.isEmpty || !stepToolCalls.isEmpty {
+                messages.append(
+                    AgentMessage(
+                        role: .assistant,
+                        text: stepText,
+                        toolCalls: stepToolCalls
+                    )
+                )
+            }
+            continuation.yield(.assistantTurn(text: stepText, toolCalls: stepToolCalls))
+
+            if stepToolCalls.isEmpty {
+                let result = AgentRunResult(
+                    finalText: stepText,
+                    messages: messages,
+                    steps: step,
+                    compactionSummary: compactionSummary
+                )
+                continuation.yield(.completed(result))
+                continuation.finish()
+                return
+            }
+
+            // Announce + run tools in batch (mirrors `run`).
+            for call in stepToolCalls { continuation.yield(.toolStarted(call)) }
+            let results = try await runToolCalls(stepToolCalls)
+            for result in results { continuation.yield(.toolFinished(result)) }
+
             messages.append(
                 AgentMessage(role: .tool, toolResults: results)
             )

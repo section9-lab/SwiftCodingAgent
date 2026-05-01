@@ -48,6 +48,12 @@ public actor AgentSDK {
         try await loop.run(userInput: prompt)
     }
 
+    /// Streamed variant of `run`. AI text is yielded incrementally as
+    /// `.textDelta` events; tool calls/results are batched. See `AgentEvent`.
+    public nonisolated func runStream(prompt: String) -> AsyncThrowingStream<AgentEvent, Error> {
+        loop.runStream(userInput: prompt)
+    }
+
     public func history() async -> [AgentMessage] {
         await loop.history()
     }

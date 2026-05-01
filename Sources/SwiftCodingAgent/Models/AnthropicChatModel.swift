@@ -44,7 +44,7 @@ public struct AnthropicChatModel: AgentModel {
         }
         urlRequest.timeoutInterval = timeout
 
-        urlRequest.httpBody = try makeRequestBody(from: request)
+        urlRequest.httpBody = try makeRequestBody(from: request, stream: false)
 
         let (data, response) = try await URLSession.shared.data(for: urlRequest)
         guard let http = response as? HTTPURLResponse else {
@@ -59,9 +59,136 @@ public struct AnthropicChatModel: AgentModel {
         return try parseResponse(data)
     }
 
+    public nonisolated func stream(request: ModelRequest) -> AsyncThrowingStream<ModelStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task { [self] in
+                do {
+                    try await self.runStream(request: request, continuation: continuation)
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private nonisolated func runStream(
+        request: ModelRequest,
+        continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation
+    ) async throws {
+        let url = baseURL.appendingPathComponent("messages")
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        urlRequest.setValue(anthropicVersion, forHTTPHeaderField: "anthropic-version")
+        if let apiKey, !apiKey.isEmpty {
+            urlRequest.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        }
+        urlRequest.timeoutInterval = timeout
+        urlRequest.httpBody = try makeRequestBody(from: request, stream: true)
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: urlRequest)
+        guard let http = response as? HTTPURLResponse else {
+            throw NSError(domain: "AnthropicChatModel", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response"])
+        }
+        guard (200...299).contains(http.statusCode) else {
+            var collected = Data()
+            for try await byte in bytes { collected.append(byte) }
+            let text = String(data: collected, encoding: .utf8) ?? ""
+            throw NSError(domain: "AnthropicChatModel", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Anthropic error (\(http.statusCode)): \(text)"])
+        }
+
+        var parser = SSEParser()
+        // Per-block-index accumulators. Anthropic emits content_block_start with
+        // a type ("text" or "tool_use"), then a stream of *_delta events, then
+        // content_block_stop. tool_use deltas carry partial JSON.
+        struct Block {
+            var type: String = "text"
+            var toolID: String?
+            var toolName: String?
+            var text: String = ""
+            var argsJSON: String = ""
+        }
+        var blocks: [Int: Block] = [:]
+        var fullText = ""
+        var assembled: [ToolCall] = []
+
+        for try await line in bytes.lines {
+            let events = parser.feed(line + "\n")
+            for payload in events {
+                guard let data = payload.data(using: .utf8),
+                      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else { continue }
+                let type = root["type"] as? String
+
+                switch type {
+                case "content_block_start":
+                    let index = (root["index"] as? Int) ?? 0
+                    var block = blocks[index] ?? Block()
+                    if let cb = root["content_block"] as? [String: Any] {
+                        block.type = (cb["type"] as? String) ?? "text"
+                        block.toolID = cb["id"] as? String
+                        block.toolName = cb["name"] as? String
+                    }
+                    blocks[index] = block
+
+                case "content_block_delta":
+                    let index = (root["index"] as? Int) ?? 0
+                    var block = blocks[index] ?? Block()
+                    if let delta = root["delta"] as? [String: Any] {
+                        switch delta["type"] as? String {
+                        case "text_delta":
+                            if let t = delta["text"] as? String, !t.isEmpty {
+                                block.text += t
+                                fullText += t
+                                continuation.yield(.textDelta(t))
+                            }
+                        case "input_json_delta":
+                            if let partial = delta["partial_json"] as? String {
+                                block.argsJSON += partial
+                            }
+                        default:
+                            break
+                        }
+                    }
+                    blocks[index] = block
+
+                case "content_block_stop":
+                    let index = (root["index"] as? Int) ?? 0
+                    guard let block = blocks[index] else { continue }
+                    if block.type == "tool_use",
+                       let id = block.toolID,
+                       let name = block.toolName {
+                        let call = ToolCall(
+                            id: id,
+                            name: name,
+                            argumentsJSON: block.argsJSON.isEmpty ? "{}" : block.argsJSON
+                        )
+                        assembled.append(call)
+                        continuation.yield(.toolCall(call))
+                    }
+
+                case "message_stop", "error":
+                    // Stream end / error event — `error` would typically come
+                    // as an HTTP-level failure already, but if the server emits
+                    // it mid-stream we just fall through to finish.
+                    break
+
+                default:
+                    break
+                }
+            }
+        }
+
+        let assembledResponse = ModelResponse(content: fullText, toolCalls: assembled, usage: nil)
+        continuation.yield(.completed(assembledResponse))
+        continuation.finish()
+    }
+
     // MARK: - Request encoding
 
-    nonisolated func makeRequestBody(from request: ModelRequest) throws -> Data {
+    nonisolated func makeRequestBody(from request: ModelRequest, stream: Bool = false) throws -> Data {
         var systemTexts: [String] = []
         var conversational: [AgentMessage] = []
         for message in request.messages {
@@ -75,7 +202,8 @@ public struct AnthropicChatModel: AgentModel {
         var payload: [String: Any] = [
             "model": modelName,
             "max_tokens": maxTokens,
-            "messages": encodeMessages(conversational)
+            "messages": encodeMessages(conversational),
+            "stream": stream
         ]
 
         if !systemTexts.isEmpty {

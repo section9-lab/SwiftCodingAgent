@@ -117,4 +117,49 @@ public struct ModelResponse: Sendable {
 
 public protocol AgentModel: Sendable {
     func generate(request: ModelRequest) async throws -> ModelResponse
+
+    /// Streamed variant. Yields incremental text deltas as they arrive, plus
+    /// fully-assembled tool calls (tool calls are NOT split into deltas — the
+    /// adapter buffers the partial JSON arguments and emits a single
+    /// `.toolCall` event per call once it's complete). Ends with `.completed`.
+    ///
+    /// The default implementation falls back to `generate` and synthesises a
+    /// single text event followed by tool calls, so adapters that don't
+    /// support streaming still satisfy the protocol.
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelStreamEvent, Error>
+}
+
+public enum ModelStreamEvent: Sendable {
+    /// Incremental text fragment from the assistant. Concatenate to build the
+    /// full text.
+    case textDelta(String)
+    /// A fully-assembled tool call. Emitted once the adapter has the complete
+    /// arguments JSON.
+    case toolCall(ToolCall)
+    /// Final marker; carries the full assembled response so callers that don't
+    /// want to track state themselves can grab it.
+    case completed(ModelResponse)
+}
+
+public extension AgentModel {
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let response = try await generate(request: request)
+                    if !response.content.isEmpty {
+                        continuation.yield(.textDelta(response.content))
+                    }
+                    for call in response.toolCalls {
+                        continuation.yield(.toolCall(call))
+                    }
+                    continuation.yield(.completed(response))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
