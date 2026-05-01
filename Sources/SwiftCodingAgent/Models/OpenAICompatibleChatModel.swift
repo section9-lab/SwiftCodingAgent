@@ -1,4 +1,5 @@
 import Foundation
+import EventSource
 
 public struct OpenAICompatibleChatModel: AgentModel {
     public let baseURL: URL
@@ -91,7 +92,6 @@ public struct OpenAICompatibleChatModel: AgentModel {
             throw NSError(domain: "OpenAICompatibleChatModel", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "OpenAI-compatible error (\(http.statusCode)): \(text)"])
         }
 
-        var parser = SSEParser()
         // Tool calls arrive as deltas indexed by position. We accumulate per
         // index and emit a single `.toolCall` event when the stream finishes.
         struct PartialCall {
@@ -101,50 +101,55 @@ public struct OpenAICompatibleChatModel: AgentModel {
         }
         var partials: [Int: PartialCall] = [:]
         var fullText = ""
+        var fullReasoning = ""
 
-        for try await line in bytes.lines {
-            let events = parser.feed(line + "\n")
-            for payload in events {
-                if payload == "[DONE]" {
-                    continue
-                }
-                guard let data = payload.data(using: .utf8),
-                      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let choices = root["choices"] as? [[String: Any]],
-                      let first = choices.first,
-                      let delta = first["delta"] as? [String: Any]
-                else { continue }
+        // SSE parsing is delegated to mattt/EventSource. It iterates the byte
+        // stream, handles CRLF/LF/CR line breaks, multi-line `data:` payloads,
+        // event ID and retry fields, and reliably emits one event per blank
+        // line — solving the edge case where `URLSession.AsyncBytes.lines`
+        // collapses the separator blank line and our previous in-house parser
+        // never flushed.
+        for try await sse in bytes.events {
+            let payload = sse.data
+            if payload == "[DONE]" { continue }
 
-                if let textDelta = delta["content"] as? String, !textDelta.isEmpty {
-                    fullText += textDelta
-                    continuation.yield(.textDelta(textDelta))
-                }
+            guard let data = payload.data(using: .utf8),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choices = root["choices"] as? [[String: Any]],
+                  let first = choices.first,
+                  let delta = first["delta"] as? [String: Any]
+            else { continue }
 
-                // Reasoning models (NVIDIA NIM with GPT-OSS, DeepSeek-R1,
-                // Qwen-Thinking, OpenAI o1-style) stream their chain-of-thought
-                // in a separate `reasoning_content` field. We forward it as a
-                // distinct event so callers can present it in a collapsed pane
-                // (or hide it entirely) without it getting merged into the
-                // final answer.
-                if let reasoningDelta = delta["reasoning_content"] as? String, !reasoningDelta.isEmpty {
-                    continuation.yield(.reasoningDelta(reasoningDelta))
-                }
+            if let textDelta = delta["content"] as? String, !textDelta.isEmpty {
+                fullText += textDelta
+                continuation.yield(.textDelta(textDelta))
+            }
 
-                if let toolDeltas = delta["tool_calls"] as? [[String: Any]] {
-                    for item in toolDeltas {
-                        let index = (item["index"] as? Int) ?? 0
-                        var partial = partials[index] ?? PartialCall()
-                        if let id = item["id"] as? String, !id.isEmpty { partial.id = id }
-                        if let function = item["function"] as? [String: Any] {
-                            if let name = function["name"] as? String, !name.isEmpty {
-                                partial.name += name
-                            }
-                            if let args = function["arguments"] as? String {
-                                partial.arguments += args
-                            }
+            // Reasoning models (NVIDIA NIM with GPT-OSS, DeepSeek-R1,
+            // Qwen-Thinking, OpenAI o1-style) stream their chain-of-thought
+            // in a separate `reasoning_content` field. We forward it as a
+            // distinct event so callers can present it in a collapsed pane
+            // (or hide it entirely) without it getting merged into the
+            // final answer.
+            if let reasoningDelta = delta["reasoning_content"] as? String, !reasoningDelta.isEmpty {
+                fullReasoning += reasoningDelta
+                continuation.yield(.reasoningDelta(reasoningDelta))
+            }
+
+            if let toolDeltas = delta["tool_calls"] as? [[String: Any]] {
+                for item in toolDeltas {
+                    let index = (item["index"] as? Int) ?? 0
+                    var partial = partials[index] ?? PartialCall()
+                    if let id = item["id"] as? String, !id.isEmpty { partial.id = id }
+                    if let function = item["function"] as? [String: Any] {
+                        if let name = function["name"] as? String, !name.isEmpty {
+                            partial.name += name
                         }
-                        partials[index] = partial
+                        if let args = function["arguments"] as? String {
+                            partial.arguments += args
+                        }
                     }
+                    partials[index] = partial
                 }
             }
         }
@@ -162,7 +167,12 @@ public struct OpenAICompatibleChatModel: AgentModel {
 
         for call in assembled { continuation.yield(.toolCall(call)) }
 
-        let assembledResponse = ModelResponse(content: fullText, toolCalls: assembled, usage: nil)
+        // Reasoning models (NIM gpt-oss, etc.) sometimes stream the entire
+        // answer through `reasoning_content` and never emit a `content`
+        // delta. Fall back to the assembled reasoning so callers don't see
+        // an empty final response. This mirrors the non-stream `parseResponse`.
+        let effectiveText = fullText.isEmpty && assembled.isEmpty ? fullReasoning : fullText
+        let assembledResponse = ModelResponse(content: effectiveText, toolCalls: assembled, usage: nil)
         continuation.yield(.completed(assembledResponse))
         continuation.finish()
     }
