@@ -21,6 +21,8 @@ public struct BashTool: AgentTool {
 
         let args = try JSONDecoder.toolDecoder.decode(Args.self, from: data)
         try await requestApprovalIfNeeded(for: args.command, context: context)
+
+        #if os(macOS)
         return try runCommand(
             args.command,
             cwd: context.workingDirectory,
@@ -28,8 +30,15 @@ public struct BashTool: AgentTool {
             allowedRoots: context.allowedRoots,
             policy: context.bashExecutionPolicy
         )
+        #else
+        // Process / sandbox-exec are macOS-only. iOS sandboxes the host app
+        // itself, and Linux would need a different sandbox mechanism (seccomp,
+        // bubblewrap, etc.). Fail loudly rather than silently no-op.
+        throw ToolError.commandFailed("BashTool is only supported on macOS in this build")
+        #endif
     }
 
+    #if os(macOS)
     private func runCommand(
         _ command: String,
         cwd: URL,
@@ -147,6 +156,7 @@ public struct BashTool: AgentTool {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
     }
+    #endif
 
     private func requestApprovalIfNeeded(for command: String, context: ToolExecutionContext) async throws {
         guard let risk = BashRiskClassifier.classify(command) else { return }

@@ -185,4 +185,49 @@ struct AgentLoopTests {
         #expect(result.finalText == "done")
         #expect(result.steps == 2)
     }
+
+    @Test
+    func parallelToolCallsAreGroupedIntoOneAssistantMessage() async throws {
+        let counter = LockedBox(0)
+        let tool = RecordingTool { _ in
+            await counter.set((await counter.get()) + 1)
+            return "ok"
+        }
+
+        let model = MockModel(
+            responses: [
+                ModelResponse(
+                    content: "running",
+                    toolCalls: [
+                        ToolCall(id: "a", name: "record", argumentsJSON: "{}"),
+                        ToolCall(id: "b", name: "record", argumentsJSON: "{}"),
+                        ToolCall(id: "c", name: "record", argumentsJSON: "{}")
+                    ]
+                ),
+                ModelResponse(content: "all done")
+            ]
+        )
+
+        let loop = AgentLoop(
+            model: model,
+            tools: [tool],
+            config: AgentLoopConfig(
+                workingDirectory: URL(fileURLWithPath: "/tmp"),
+                parallelToolCalls: true
+            )
+        )
+
+        let result = try await loop.run(userInput: "go")
+        #expect(result.finalText == "all done")
+        #expect(await counter.get() == 3)
+
+        // Verify history shape: one assistant message with 3 tool calls,
+        // followed by one tool message with 3 results — not 6 interleaved messages.
+        let history = await loop.history()
+        let assistantWithCalls = history.first { $0.role == .assistant && !$0.toolCalls.isEmpty }
+        let toolMessage = history.first { $0.role == .tool }
+        #expect(assistantWithCalls?.toolCalls.count == 3)
+        #expect(toolMessage?.toolResults.count == 3)
+        #expect(toolMessage?.toolResults.map(\.toolCallID) == ["a", "b", "c"])
+    }
 }

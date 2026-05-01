@@ -7,6 +7,10 @@ public struct AgentLoopConfig: Sendable {
     public let toolExecutionContexts: [String: ToolExecutionContext]
     public let compaction: CompactionConfig
     public let approvalHandler: ToolApprovalHandler?
+    /// When true, tool calls returned in a single model turn run concurrently.
+    /// Default `false` because not every tool is concurrency-safe (e.g. EditTool
+    /// on the same file). Opt in once you know your tool set is safe.
+    public let parallelToolCalls: Bool
 
     public var allowedRoots: [URL] {
         executionPolicy.fileAccess.allowedRoots
@@ -19,7 +23,8 @@ public struct AgentLoopConfig: Sendable {
         executionPolicy: ToolExecutionPolicy? = nil,
         toolExecutionContexts: [String: ToolExecutionContext] = [:],
         compaction: CompactionConfig = .init(),
-        approvalHandler: ToolApprovalHandler? = nil
+        approvalHandler: ToolApprovalHandler? = nil,
+        parallelToolCalls: Bool = false
     ) {
         self.maxSteps = maxSteps
         self.workingDirectory = workingDirectory
@@ -30,6 +35,7 @@ public struct AgentLoopConfig: Sendable {
         self.toolExecutionContexts = toolExecutionContexts
         self.compaction = compaction
         self.approvalHandler = approvalHandler
+        self.parallelToolCalls = parallelToolCalls
     }
 
     public func context(for toolName: String) -> ToolExecutionContext {
@@ -95,7 +101,7 @@ public actor AgentLoop {
 
         var seedMessages: [AgentMessage] = []
         for skill in skills where !skill.systemPrompt.isEmpty {
-            seedMessages.append(AgentMessage(role: .system, content: "[Skill: \(skill.name)]\n\(skill.systemPrompt)"))
+            seedMessages.append(.system("[Skill: \(skill.name)]\n\(skill.systemPrompt)"))
         }
 
         self.messages = seedMessages
@@ -126,7 +132,7 @@ public actor AgentLoop {
 
     @discardableResult
     public func run(userInput: String) async throws -> AgentRunResult {
-        messages.append(AgentMessage(role: .user, content: userInput))
+        messages.append(.user(userInput))
 
         var step = 0
 
@@ -143,8 +149,17 @@ public actor AgentLoop {
 
             let response = try await model.generate(request: request)
 
-            if !response.content.isEmpty {
-                messages.append(AgentMessage(role: .assistant, content: response.content))
+            // Persist the assistant turn as a single message carrying both the
+            // textual response and any tool calls. This matches both OpenAI's
+            // tool_calls array and Anthropic's tool_use blocks.
+            if !response.content.isEmpty || !response.toolCalls.isEmpty {
+                messages.append(
+                    AgentMessage(
+                        role: .assistant,
+                        text: response.content,
+                        toolCalls: response.toolCalls
+                    )
+                )
             }
 
             if response.toolCalls.isEmpty {
@@ -156,43 +171,79 @@ public actor AgentLoop {
                 )
             }
 
-            for call in response.toolCalls {
-                let context = config.context(for: call.name)
-                messages.append(
-                    AgentMessage(
-                        role: .assistant,
-                        content: "",
-                        toolName: call.name,
-                        toolCallID: call.id,
-                        toolArgumentsJSON: call.argumentsJSON
-                    )
-                )
+            let results = try await runToolCalls(response.toolCalls)
 
-                do {
-                    let output = try await toolRegistry.run(call: call, context: context)
-
-                    messages.append(
-                        AgentMessage(
-                            role: .tool,
-                            content: output,
-                            toolName: call.name,
-                            toolCallID: call.id
-                        )
-                    )
-                } catch {
-                    messages.append(
-                        AgentMessage(
-                            role: .tool,
-                            content: "ERROR: \(error.localizedDescription)",
-                            toolName: call.name,
-                            toolCallID: call.id
-                        )
-                    )
-                }
-            }
+            // Append all tool results in a single tool-role message so they
+            // travel together, mirroring Anthropic's "tool_result blocks in one
+            // user turn" expectation. The OpenAI adapter splits this back into
+            // individual tool messages on the wire.
+            messages.append(
+                AgentMessage(role: .tool, toolResults: results)
+            )
         }
 
         throw AgentLoopError.maxStepsReached
+    }
+
+    private func runToolCalls(_ calls: [ToolCall]) async throws -> [ToolResult] {
+        if config.parallelToolCalls && calls.count > 1 {
+            return try await withThrowingTaskGroup(of: (Int, ToolResult).self) { group in
+                for (index, call) in calls.enumerated() {
+                    let context = config.context(for: call.name)
+                    let registry = toolRegistry
+                    group.addTask {
+                        let result = await Self.executeTool(
+                            call: call,
+                            context: context,
+                            registry: registry
+                        )
+                        return (index, result)
+                    }
+                }
+
+                var collected: [(Int, ToolResult)] = []
+                for try await item in group {
+                    collected.append(item)
+                }
+                return collected.sorted { $0.0 < $1.0 }.map { $0.1 }
+            }
+        }
+
+        var results: [ToolResult] = []
+        results.reserveCapacity(calls.count)
+        for call in calls {
+            let context = config.context(for: call.name)
+            let result = await Self.executeTool(
+                call: call,
+                context: context,
+                registry: toolRegistry
+            )
+            results.append(result)
+        }
+        return results
+    }
+
+    private static func executeTool(
+        call: ToolCall,
+        context: ToolExecutionContext,
+        registry: ToolRegistry
+    ) async -> ToolResult {
+        do {
+            let output = try await registry.run(call: call, context: context)
+            return ToolResult(
+                toolCallID: call.id,
+                toolName: call.name,
+                content: output,
+                isError: false
+            )
+        } catch {
+            return ToolResult(
+                toolCallID: call.id,
+                toolName: call.name,
+                content: "ERROR: \(error.localizedDescription)",
+                isError: true
+            )
+        }
     }
 
     private func maybeCompact() async throws {
@@ -234,7 +285,7 @@ public actor AgentLoop {
         )
         let result = try await model.generate(
             request: ModelRequest(
-                messages: [AgentMessage(role: .user, content: summaryPrompt)],
+                messages: [.user(summaryPrompt)],
                 tools: []
             )
         )
@@ -242,7 +293,10 @@ public actor AgentLoop {
         let newSummary = result.content.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         guard !newSummary.isEmpty else { return false }
 
-        compactionSummary = mergeSummary(old: compactionSummary, new: newSummary, maxChars: cfg.maxSummaryChars)
+        // Compute the merged summary first, then commit both pieces of state
+        // together so a failure can't leave history pruned without a summary.
+        let merged = mergeSummary(old: compactionSummary, new: newSummary, maxChars: cfg.maxSummaryChars)
+        compactionSummary = merged
         firstKeptMessageIndex = cutPoint.index
         return true
     }
@@ -252,61 +306,14 @@ public actor AgentLoop {
         customInstructions: String?,
         isSplitTurn: Bool
     ) -> String {
-        let previousSummarySection: String
-        if let compactionSummary, !compactionSummary.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty {
-            previousSummarySection = """
-            [已有压缩摘要]
-            \(compactionSummary)
-
-            """
-        } else {
-            previousSummarySection = ""
-        }
-
-        let customSection: String
-        if let customInstructions, !customInstructions.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty {
-            customSection = """
-            [额外要求]
-            \(customInstructions.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines))
-
-            """
-        } else {
-            customSection = ""
-        }
-
-        let splitTurnSection: String
-        if isSplitTurn {
-            splitTurnSection = """
-            [注意]
-            当前发生 split-turn：被压缩内容是某个超长 turn 的前半段，请明确保留该 turn 的关键中间状态与未完成事项。
-
-            """
-        } else {
-            splitTurnSection = ""
-        }
-
-        return """
-        你是会话压缩器。请把下面的历史压缩为结构化摘要，必须忠实，不得臆造。
-
-        输出格式：
-        ## Goal
-        ## Constraints & Preferences
-        ## Progress
-        ### Done
-        ### In Progress
-        ### Blocked
-        ## Key Decisions
-        ## Next Steps
-        ## Critical Context
-
-        要求：
-        - 保留用户明确约束、技术决策、失败原因、下一步
-        - 保留关键文件路径、命令结论、错误信息
-        - 不要输出与上下文无关的内容
-
-        \(customSection)\(splitTurnSection)\(previousSummarySection)[待压缩会话]
-        \(serializedConversation)
-        """
+        config.compaction.promptBuilder(
+            CompactionPromptInput(
+                serializedConversation: serializedConversation,
+                previousSummary: compactionSummary,
+                customInstructions: customInstructions,
+                isSplitTurn: isSplitTurn
+            )
+        )
     }
 
     private func makeRequestMessages() -> [AgentMessage] {
@@ -319,19 +326,14 @@ public actor AgentLoop {
         if let compactionSummary,
            !compactionSummary.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty
         {
-            requestMessages.append(
-                AgentMessage(
-                    role: .system,
-                    content: "[Compaction Summary]\n\(compactionSummary)"
-                )
-            )
+            requestMessages.append(.system("[Compaction Summary]\n\(compactionSummary)"))
         }
 
         if firstKeptMessageIndex < messages.count {
             requestMessages.append(contentsOf: messages[firstKeptMessageIndex...])
         }
 
-        return requestMessages.filter { !($0.role == .assistant && $0.toolName != nil) }
+        return requestMessages
     }
 
     private func makeRequestTools() async -> [ModelToolSpec] {
@@ -340,7 +342,14 @@ public actor AgentLoop {
 
     private func estimateTokens(messages: [AgentMessage]) -> Int {
         messages.reduce(0) { partial, message in
-            partial + TokenEstimator.estimate(message.content) + TokenEstimator.estimate(message.toolArgumentsJSON ?? "") + 12
+            var size = TokenEstimator.estimate(message.text)
+            for call in message.toolCalls {
+                size += TokenEstimator.estimate(call.argumentsJSON)
+            }
+            for result in message.toolResults {
+                size += TokenEstimator.estimate(result.content)
+            }
+            return partial + size + 12
         }
     }
 
@@ -351,7 +360,7 @@ public actor AgentLoop {
         var idx = messages.count - 1
 
         while idx >= firstKeptMessageIndex {
-            acc += TokenEstimator.estimate(messages[idx].content) + 12
+            acc += TokenEstimator.estimate(messages[idx].text) + 12
             if acc >= keepRecentTokens {
                 break
             }
@@ -391,20 +400,26 @@ public actor AgentLoop {
         messages.map { message in
             switch message.role {
             case .system:
-                return "[System] \(message.content)"
+                return "[System] \(message.text)"
             case .user:
-                return "[User] \(message.content)"
+                return "[User] \(message.text)"
             case .assistant:
-                if let toolName = message.toolName {
-                    return "[Assistant ToolCall: \(toolName)] args=\(message.toolArgumentsJSON ?? "")"
+                var parts: [String] = []
+                if !message.text.isEmpty {
+                    parts.append("[Assistant] \(message.text)")
                 }
-                return "[Assistant] \(message.content)"
+                for call in message.toolCalls {
+                    parts.append("[Assistant ToolCall: \(call.name)] args=\(call.argumentsJSON)")
+                }
+                return parts.joined(separator: "\n")
             case .tool:
                 let maxLen = 2_000
-                let toolOutput = message.content.count > maxLen
-                    ? String(message.content.prefix(maxLen)) + " ...(truncated \(message.content.count - maxLen) chars)"
-                    : message.content
-                return "[Tool Result: \(message.toolName ?? "unknown")] \(toolOutput)"
+                return message.toolResults.map { result in
+                    let truncated = result.content.count > maxLen
+                        ? String(result.content.prefix(maxLen)) + " ...(truncated \(result.content.count - maxLen) chars)"
+                        : result.content
+                    return "[Tool Result: \(result.toolName)] \(truncated)"
+                }.joined(separator: "\n")
             }
         }
         .joined(separator: "\n")

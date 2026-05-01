@@ -31,7 +31,7 @@ struct SwiftCodingAgentExample {
         print("\n--- Message History ---")
         let history = await agent.history()
         for msg in history {
-            print("[\(msg.role)] \(msg.content.prefix(100))...")
+            print("[\(msg.role)] \(msg.text.prefix(100))...")
         }
     }
 }

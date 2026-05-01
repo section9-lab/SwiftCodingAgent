@@ -35,10 +35,10 @@ It is especially useful when you want to:
 Build and run agents directly in Swift with `AgentSDK`, `AgentLoop`, and a small set of composable protocols.
 
 ### OpenAI-compatible model integration
-Plug in any backend that speaks the OpenAI Chat Completions format with `OpenAICompatibleChatModel`, or use `EchoModel` for local testing.
+Plug in any backend that speaks the OpenAI Chat Completions format with `OpenAICompatibleChatModel`, talk to Anthropic directly with `AnthropicChatModel`, or use `EchoModel` for local testing.
 
 ### Built-in tool system
-The package includes `read`, `write`, `edit`, and `bash` tools, plus the `AgentTool` protocol for adding your own tools.
+The package includes `read`, `write`, `edit`, and `bash` tools, plus the `AgentTool` protocol for adding your own tools. `read` caps file size by default to keep tool output from blowing past the model's context window. `bash` is macOS-only (uses `sandbox-exec`); on other platforms it raises an explicit error.
 
 ### Explicit execution boundaries
 File access and shell execution are controlled through `ToolExecutionPolicy`, so apps can decide exactly what an agent is allowed to touch.
@@ -114,6 +114,24 @@ let result = try await agent.run(
 print(result.finalText)
 ```
 
+To use Anthropic's Claude models directly via the Messages API:
+
+```swift
+let model = AnthropicChatModel(
+    apiKey: ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"],
+    modelName: "claude-sonnet-4-5"
+)
+
+let agent = AgentSDK(
+    model: model,
+    workingDirectory: workspaceURL,
+    executionPolicy: ToolExecutionPolicy(
+        workingDirectory: workspaceURL,
+        bash: .disabled
+    )
+)
+```
+
 For local smoke testing without any API key:
 
 ```swift
@@ -133,7 +151,7 @@ let agent = AgentSDK(
 `AgentSDK` is the main entry point. It assembles the model, tools, skills, execution policy, working directory, and compaction settings into a runnable agent.
 
 ### Models
-Implement `AgentModel` to connect your own backend, or use `OpenAICompatibleChatModel` for providers that expose the OpenAI-compatible chat API shape.
+Implement `AgentModel` to connect your own backend, use `OpenAICompatibleChatModel` for providers that expose the OpenAI-compatible chat API shape, or use `AnthropicChatModel` for Anthropic's Messages API (with native `tool_use` / `tool_result` support).
 
 ### Tools
 Implement `AgentTool` to expose capabilities. Every tool runs with a `ToolExecutionContext`, which includes the working directory and the effective execution policy.

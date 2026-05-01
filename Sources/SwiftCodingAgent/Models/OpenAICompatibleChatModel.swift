@@ -43,10 +43,10 @@ public struct OpenAICompatibleChatModel: AgentModel {
         return try parseResponse(data)
     }
 
-    private nonisolated func makeRequestBody(from request: ModelRequest) throws -> Data {
+    nonisolated func makeRequestBody(from request: ModelRequest) throws -> Data {
         let payload: [String: Any] = [
             "model": modelName,
-            "messages": request.messages.map { messageToDictionary($0) },
+            "messages": encodeMessages(request.messages),
             "tools": request.tools.map { toolToDictionary($0) },
             "tool_choice": "auto",
             "temperature": 0.2,
@@ -56,20 +56,51 @@ public struct OpenAICompatibleChatModel: AgentModel {
         return try JSONSerialization.data(withJSONObject: payload, options: [])
     }
 
-    private nonisolated func messageToDictionary(_ message: AgentMessage) -> [String: Any] {
-        switch message.role {
-        case .tool:
-            return [
-                "role": "tool",
-                "content": message.content,
-                "tool_call_id": message.toolCallID ?? ""
-            ]
-        case .system, .user, .assistant:
-            return [
-                "role": roleString(message.role),
-                "content": message.content
-            ]
+    /// Translate the loop's `[AgentMessage]` history into OpenAI's wire format.
+    /// One internal `tool`-role message carrying multiple `ToolResult`s expands
+    /// into one wire `role: "tool"` message per result, each tagged with the
+    /// originating `tool_call_id`.
+    nonisolated func encodeMessages(_ messages: [AgentMessage]) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+
+        for message in messages {
+            switch message.role {
+            case .system:
+                out.append(["role": "system", "content": message.text])
+
+            case .user:
+                out.append(["role": "user", "content": message.text])
+
+            case .assistant:
+                var dict: [String: Any] = ["role": "assistant"]
+                // OpenAI accepts content: null when only tool_calls are present.
+                dict["content"] = message.text.isEmpty ? NSNull() : message.text
+                if !message.toolCalls.isEmpty {
+                    dict["tool_calls"] = message.toolCalls.map { call in
+                        [
+                            "id": call.id,
+                            "type": "function",
+                            "function": [
+                                "name": call.name,
+                                "arguments": call.argumentsJSON
+                            ]
+                        ] as [String: Any]
+                    }
+                }
+                out.append(dict)
+
+            case .tool:
+                for result in message.toolResults {
+                    out.append([
+                        "role": "tool",
+                        "content": result.content,
+                        "tool_call_id": result.toolCallID
+                    ])
+                }
+            }
         }
+
+        return out
     }
 
     private nonisolated func toolToDictionary(_ tool: ModelToolSpec) -> [String: Any] {
@@ -84,15 +115,6 @@ public struct OpenAICompatibleChatModel: AgentModel {
                 "parameters": schema
             ]
         ]
-    }
-
-    private nonisolated func roleString(_ role: AgentRole) -> String {
-        switch role {
-        case .system: return "system"
-        case .user: return "user"
-        case .assistant: return "assistant"
-        case .tool: return "tool"
-        }
     }
 
     private nonisolated func parseResponse(_ data: Data) throws -> ModelResponse {
@@ -131,6 +153,13 @@ public struct OpenAICompatibleChatModel: AgentModel {
             return ToolCall(id: id, name: name, argumentsJSON: argumentsJSON)
         }
 
-        return ModelResponse(content: content, toolCalls: toolCalls)
+        let usage = (root["usage"] as? [String: Any]).map { u in
+            ModelUsage(
+                inputTokens: u["prompt_tokens"] as? Int,
+                outputTokens: u["completion_tokens"] as? Int
+            )
+        }
+
+        return ModelResponse(content: content, toolCalls: toolCalls, usage: usage)
     }
 }
