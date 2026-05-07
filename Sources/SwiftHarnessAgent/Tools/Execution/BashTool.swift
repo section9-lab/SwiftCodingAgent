@@ -26,7 +26,7 @@ public struct BashTool: AgentTool {
         return try runCommand(
             args.command,
             cwd: context.workingDirectory,
-            timeout: args.timeoutSeconds ?? 15,
+            timeout: args.timeoutSeconds ?? 60,
             allowedRoots: context.allowedRoots,
             policy: context.bashExecutionPolicy
         )
@@ -86,9 +86,30 @@ public struct BashTool: AgentTool {
         process.standardOutput = outputPipe
         process.standardError = outputPipe
 
+        // Drain the pipe on a background queue. The kernel pipe buffer is small
+        // (~64KB on macOS); if we wait until process exit to read, any command
+        // producing more than that will block on write and never terminate —
+        // we'd then kill it with terminate() and surface "(No output)" while
+        // the user sees the tool hang. Reading concurrently keeps the buffer
+        // empty and lets the child exit on its own.
+        let outputLock = NSLock()
+        var collected = Data()
+        let readHandle = outputPipe.fileHandleForReading
+        readHandle.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            outputLock.lock()
+            collected.append(chunk)
+            outputLock.unlock()
+        }
+
         do {
             try process.run()
         } catch {
+            readHandle.readabilityHandler = nil
             throw ToolError.commandFailed("Unable to start sandboxed process: \(error.localizedDescription)")
         }
 
@@ -97,13 +118,44 @@ public struct BashTool: AgentTool {
             Thread.sleep(forTimeInterval: 0.05)
         }
 
-        if process.isRunning {
+        let timedOut = process.isRunning
+        if timedOut {
             process.terminate()
-            throw ToolError.commandFailed("Timed out after \(timeout)s")
+            // Give the OS a moment to flush the final bytes before we read.
+            process.waitUntilExit()
         }
 
-        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
+        readHandle.readabilityHandler = nil
+        // Pick up any tail bytes that were sitting in the pipe after EOF.
+        if let tail = try? readHandle.readToEnd(), !tail.isEmpty {
+            outputLock.lock()
+            collected.append(tail)
+            outputLock.unlock()
+        }
+
+        outputLock.lock()
+        let rawOutput = String(data: collected, encoding: .utf8) ?? ""
+        outputLock.unlock()
+
+        // Cap the output we hand back to the model. Commands like `ls -R` or
+        // `find` in a large repo can produce hundreds of KB; sending all of it
+        // back through the chat tool message blows up context and often hangs
+        // the model mid-response. Keep head + tail so the model still sees
+        // both the start and the conclusion of the output.
+        let outputCap = 16_000
+        let output: String
+        if rawOutput.count > outputCap {
+            let head = rawOutput.prefix(outputCap / 2)
+            let tail = rawOutput.suffix(outputCap / 2)
+            let dropped = rawOutput.count - head.count - tail.count
+            output = "\(head)\n\n...(truncated \(dropped) bytes from middle; run a more specific command to see more)\n\n\(tail)"
+        } else {
+            output = rawOutput
+        }
+
+        if timedOut {
+            throw ToolError.commandFailed("Timed out after \(timeout)s\(output.isEmpty ? "" : "\n\(output)")")
+        }
 
         if process.terminationStatus == 0 {
             return output.isEmpty ? "Command finished successfully." : output
