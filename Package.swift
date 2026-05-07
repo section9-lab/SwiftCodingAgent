@@ -2,14 +2,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "SwiftCodingAgent",
+    name: "SwiftHarnessAgent",
     platforms: [
         .macOS(.v13),
         .iOS(.v17)
     ],
     products: [
-        .library(name: "SwiftCodingAgent", targets: ["SwiftCodingAgent"]),
-        .executable(name: "SwiftCodingAgentExample", targets: ["SwiftCodingAgentExample"])
+        .library(name: "SwiftHarnessAgent", targets: ["SwiftHarnessAgent"]),
+        .executable(name: "SwiftHarnessAgentExample", targets: ["SwiftHarnessAgentExample"])
     ],
     dependencies: [
         // Spec-compliant SSE parser. Used to consume OpenAI/NIM/Anthropic
@@ -20,21 +20,21 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "SwiftCodingAgent",
+            name: "SwiftHarnessAgent",
             dependencies: [
                 .product(name: "EventSource", package: "EventSource")
             ],
-            path: "Sources/SwiftCodingAgent"
+            path: "Sources/SwiftHarnessAgent"
         ),
         .testTarget(
-            name: "SwiftCodingAgentTests",
-            dependencies: ["SwiftCodingAgent"],
-            path: "Tests/SwiftCodingAgentTests"
+            name: "SwiftHarnessAgentTests",
+            dependencies: ["SwiftHarnessAgent"],
+            path: "Tests/SwiftHarnessAgentTests"
         ),
         .executableTarget(
-            name: "SwiftCodingAgentExample",
-            dependencies: ["SwiftCodingAgent"],
-            path: "Examples/SwiftCodingAgentExample"
+            name: "SwiftHarnessAgentExample",
+            dependencies: ["SwiftHarnessAgent"],
+            path: "Examples/SwiftHarnessAgentExample"
         )
     ]
 )

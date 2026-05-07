@@ -1,5 +1,5 @@
 import Testing
-@testable import SwiftCodingAgent
+@testable import SwiftHarnessAgent
 import Foundation
 
 struct FileToolSupportTests {

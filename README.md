@@ -1,23 +1,23 @@
 <div align="center">
-<img src="public/SwiftCodingAgent.png" alt="SwiftCodingAgent icon" width="120" height="120">
-<h1 align="center">SwiftCodingAgent</h1>
+<img src="public/SwiftHarnessAgent.png" alt="SwiftHarnessAgent icon" width="120" height="120">
+<h1 align="center">SwiftHarnessAgent</h1>
 <p align="center">
     A native Swift package for building tool-using coding agents.
 </p>
 <p align="center">
-SwiftCodingAgent gives you the core pieces needed to build an agent runtime in Swift: model adapters, a multi-step agent loop, skill loading, built-in tools, and explicit execution boundaries for file access and shell commands.
+SwiftHarnessAgent gives you the core pieces needed to build an agent runtime in Swift: model adapters, a multi-step agent loop, skill loading, built-in tools, and explicit execution boundaries for file access and shell commands.
 
-It is designed for apps that need real agent behavior instead of a thin chat wrapper. One example is Loggo, which uses SwiftCodingAgent as its agent foundation.
+It is designed for apps that need real agent behavior instead of a thin chat wrapper. One example is Loggo, which uses SwiftHarnessAgent as its agent foundation.
 </p>
 
-[![GitHub Star](https://img.shields.io/github/stars/section9-lab/SwiftCodingAgent?style=rounded&color=white&labelColor=000000)](https://github.com/section9-lab/SwiftCodingAgent/stargazers)
-[![GitHub license](https://img.shields.io/github/license/section9-lab/SwiftCodingAgent?style=rounded&color=white&labelColor=000000)](LICENSE)
+[![GitHub Star](https://img.shields.io/github/stars/section9-lab/SwiftHarnessAgent?style=rounded&color=white&labelColor=000000)](https://github.com/section9-lab/SwiftHarnessAgent/stargazers)
+[![GitHub license](https://img.shields.io/github/license/section9-lab/SwiftHarnessAgent?style=rounded&color=white&labelColor=000000)](LICENSE)
 
 </div>
 
-## Why SwiftCodingAgent
+## Why SwiftHarnessAgent
 
-SwiftCodingAgent is built for Swift apps that want to embed an agent without pushing the whole runtime into another language.
+SwiftHarnessAgent is built for Swift apps that want to embed an agent without pushing the whole runtime into another language.
 
 Instead of wiring prompts, tool schemas, execution guards, message history, and context compaction from scratch, you get a focused package that already handles the agent loop and the operational boundaries around it.
 
@@ -56,11 +56,11 @@ Load skills from SKILL.md directories with `SkillLoader`, making it easier to pa
 
 ## Installation
 
-Add SwiftCodingAgent with Swift Package Manager:
+Add SwiftHarnessAgent with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(path: "../SwiftCodingAgent")
+    .package(path: "../SwiftHarnessAgent")
 ]
 ```
 
@@ -78,7 +78,7 @@ Then add the product to your target:
 .target(
     name: "YourApp",
     dependencies: [
-        .product(name: "SwiftCodingAgent", package: "SwiftCodingAgent")
+        .product(name: "SwiftHarnessAgent", package: "SwiftHarnessAgent")
     ]
 )
 ```
@@ -87,7 +87,7 @@ Then add the product to your target:
 
 ```swift
 import Foundation
-import SwiftCodingAgent
+import SwiftHarnessAgent
 
 let workspaceURL = URL(fileURLWithPath: "/path/to/workspace")
 
@@ -174,7 +174,7 @@ Use `CompactionConfig` when you need the agent to handle longer histories withou
 
 ```swift
 import Foundation
-import SwiftCodingAgent
+import SwiftHarnessAgent
 
 struct CurrentTimeTool: AgentTool {
     let name = "current_time"
@@ -222,7 +222,7 @@ swift test
 Run the example executable with:
 
 ```bash
-swift run SwiftCodingAgentExample
+swift run SwiftHarnessAgentExample
 ```
 
 ## License
