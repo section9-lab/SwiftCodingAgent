@@ -14,29 +14,22 @@ private actor MockState {
 private actor LockedBox<Value: Sendable> {
     private var value: Value
 
-    init(_ value: Value) {
-        self.value = value
-    }
-
-    func set(_ newValue: Value) {
-        value = newValue
-    }
-
-    func get() -> Value {
-        value
-    }
+    init(_ value: Value) { self.value = value }
+    func set(_ newValue: Value) { value = newValue }
+    func get() -> Value { value }
 }
 
-private struct MockModel: AgentModel {
-    let responses: [ModelResponse]
+private struct MockClient: LLMClient {
+    let responses: [LLMResponse]
     let state = MockState()
 
-    func generate(request: ModelRequest) async throws -> ModelResponse {
+    func complete(_ request: LLMRequest) async throws -> LLMResponse {
         let i = await state.next()
-        if i < responses.count {
-            return responses[i]
-        }
-        return ModelResponse(content: "done")
+        if i < responses.count { return responses[i] }
+        return LLMResponse(
+            message: LLMMessage(role: .assistant, content: [.text("done")]),
+            stopReason: .endTurn
+        )
     }
 }
 
@@ -49,6 +42,18 @@ private struct RecordingTool: AgentTool {
     func run(argumentsJSON: String, context: ToolExecutionContext) async throws -> String {
         try await onRun(context)
     }
+}
+
+/// Convenience to build an assistant response carrying one or more tool uses
+/// plus optional text.
+private func assistant(_ text: String, toolUses: [LLMToolUse] = []) -> LLMResponse {
+    var content: [LLMContentBlock] = []
+    if !text.isEmpty { content.append(.text(text)) }
+    for use in toolUses { content.append(.toolUse(use)) }
+    return LLMResponse(
+        message: LLMMessage(role: .assistant, content: content),
+        stopReason: toolUses.isEmpty ? .endTurn : .toolUse
+    )
 }
 
 struct AgentLoopTests {
@@ -85,18 +90,14 @@ struct AgentLoopTests {
             await state.set(context)
             return "ok"
         }
-        let model = MockModel(
-            responses: [
-                ModelResponse(
-                    content: "",
-                    toolCalls: [ToolCall(name: "record", argumentsJSON: "{}")]
-                ),
-                ModelResponse(content: "done")
-            ]
-        )
+        let client = MockClient(responses: [
+            assistant("", toolUses: [LLMToolUse(id: "1", name: "record", argumentsJSON: "{}")]),
+            assistant("done")
+        ])
 
         let loop = AgentLoop(
-            model: model,
+            client: client,
+            modelName: "mock",
             tools: [tool],
             config: AgentLoopConfig(
                 workingDirectory: URL(fileURLWithPath: "/tmp/agent-home"),
@@ -147,9 +148,10 @@ struct AgentLoopTests {
 
     @Test
     func finalTextWithoutTool() async throws {
-        let model = MockModel(responses: [ModelResponse(content: "hello")])
+        let client = MockClient(responses: [assistant("hello")])
         let loop = AgentLoop(
-            model: model,
+            client: client,
+            modelName: "mock",
             config: AgentLoopConfig(workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
         )
 
@@ -160,24 +162,18 @@ struct AgentLoopTests {
 
     @Test
     func toolCallStillWorks() async throws {
-        let model = MockModel(
-            responses: [
-                ModelResponse(
-                    content: "",
-                    toolCalls: [
-                        ToolCall(
-                            id: "read-1",
-                            name: "read",
-                            argumentsJSON: "{\"path\":\"README.md\"}"
-                        )
-                    ]
-                ),
-                ModelResponse(content: "done")
-            ]
-        )
+        let client = MockClient(responses: [
+            assistant("", toolUses: [LLMToolUse(
+                id: "read-1",
+                name: "read",
+                argumentsJSON: #"{"path":"README.md"}"#
+            )]),
+            assistant("done")
+        ])
 
         let loop = AgentLoop(
-            model: model,
+            client: client,
+            modelName: "mock",
             config: AgentLoopConfig(workingDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
         )
 
@@ -194,22 +190,18 @@ struct AgentLoopTests {
             return "ok"
         }
 
-        let model = MockModel(
-            responses: [
-                ModelResponse(
-                    content: "running",
-                    toolCalls: [
-                        ToolCall(id: "a", name: "record", argumentsJSON: "{}"),
-                        ToolCall(id: "b", name: "record", argumentsJSON: "{}"),
-                        ToolCall(id: "c", name: "record", argumentsJSON: "{}")
-                    ]
-                ),
-                ModelResponse(content: "all done")
-            ]
-        )
+        let client = MockClient(responses: [
+            assistant("running", toolUses: [
+                LLMToolUse(id: "a", name: "record", argumentsJSON: "{}"),
+                LLMToolUse(id: "b", name: "record", argumentsJSON: "{}"),
+                LLMToolUse(id: "c", name: "record", argumentsJSON: "{}")
+            ]),
+            assistant("all done")
+        ])
 
         let loop = AgentLoop(
-            model: model,
+            client: client,
+            modelName: "mock",
             tools: [tool],
             config: AgentLoopConfig(
                 workingDirectory: URL(fileURLWithPath: "/tmp"),
@@ -221,13 +213,13 @@ struct AgentLoopTests {
         #expect(result.finalText == "all done")
         #expect(await counter.get() == 3)
 
-        // Verify history shape: one assistant message with 3 tool calls,
-        // followed by one tool message with 3 results — not 6 interleaved messages.
+        // One assistant message with 3 tool_use blocks, followed by one tool
+        // message with 3 tool_result blocks — not 6 interleaved messages.
         let history = await loop.history()
-        let assistantWithCalls = history.first { $0.role == .assistant && !$0.toolCalls.isEmpty }
+        let assistantWithCalls = history.first { $0.role == .assistant && !$0.toolUses.isEmpty }
         let toolMessage = history.first { $0.role == .tool }
-        #expect(assistantWithCalls?.toolCalls.count == 3)
+        #expect(assistantWithCalls?.toolUses.count == 3)
         #expect(toolMessage?.toolResults.count == 3)
-        #expect(toolMessage?.toolResults.map(\.toolCallID) == ["a", "b", "c"])
+        #expect(toolMessage?.toolResults.map(\.toolUseID) == ["a", "b", "c"])
     }
 }

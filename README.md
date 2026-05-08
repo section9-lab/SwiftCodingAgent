@@ -23,7 +23,8 @@ import SwiftHarnessAgent
 let workspace = URL(fileURLWithPath: ".")
 
 let agent = AgentSDK(
-    model: EchoModel(),                                 // swap with OpenAICompatibleChatModel / AnthropicChatModel
+    client: EchoClient(),                               // swap with OpenAIChatCompletionsClient / AnthropicMessagesClient
+    modelName: "echo",
     workingDirectory: workspace,
     executionPolicy: ToolExecutionPolicy(workingDirectory: workspace)
 )
@@ -31,6 +32,44 @@ let agent = AgentSDK(
 let result = try await agent.run(prompt: "Read README.md and summarize")
 print(result.finalText)
 ```
+
+## Architecture
+
+SwiftHarnessAgent is a **monorepo** containing two Swift Package Manager products:
+
+- **`SwiftAISDK`** — provider-agnostic LLM client layer. Use this directly if you only want OpenAI / Anthropic API access without the agent runtime.
+- **`SwiftHarnessAgent`** — coding-agent runtime built on top of SwiftAISDK. Includes the multi-step loop, tools, skills, subagents, and compaction.
+
+Both products live in the same `Package.swift` and share a single `Package.resolved`, following the pattern used by `swift-collections` and `swift-async-algorithms`.
+
+### SwiftAISDK
+
+Provider-agnostic LLM client with rich content-block support:
+
+- **`LLMClient` protocol** — implement for any backend
+- **`LLMMessage`** — role + array of typed content blocks (text, image, reasoning, toolUse, toolResult, refusal)
+- **`LLMContentBlock`** — preserves reasoning signatures (Anthropic extended thinking), encrypted reasoning (OpenAI Responses), and tool-use metadata across turns
+- **Built-in clients:**
+  - `EchoClient` — local stub, no API key needed
+  - `OpenAIChatCompletionsClient` — `/v1/chat/completions` (OpenAI, NVIDIA NIM, vLLM, Ollama, Together, Groq, etc.)
+  - `OpenAIResponsesClient` — `/v1/responses` (OpenAI's newer protocol with reasoning persistence and server-side state)
+  - `AnthropicMessagesClient` — `/v1/messages` with extended thinking + signature round-tripping
+
+The SDK's content-block model is **lossless** — reasoning blocks with signatures (required for Anthropic extended-thinking + tool-use multi-turn correctness) and encrypted reasoning (OpenAI Responses) are preserved verbatim across turns.
+
+### SwiftHarnessAgent
+
+Coding-agent runtime:
+
+- `AgentSDK` — main entry, assembles client + tools + policy + skills + compaction
+- `AgentLoop` — the multi-step reasoning loop
+- `ToolExecutionPolicy` — file allow-roots and bash sandboxing (disabled / sandboxed / unrestricted)
+- `ReadTool` / `WriteTool` / `EditTool` / `BashTool`
+- `TodoStore` + `TodoWriteTool` — phased task tracking with a live `phasesStream()`
+- `AskTool` — interactive user prompts via an `AskHandler` closure
+- `TaskCoordinator` + `SubagentDefinition` — parallel subagent fan-out
+- `SkillLoader` — load `SKILL.md` directories into reusable skill definitions
+- `CompactionConfig` — summarize older context to keep long histories bounded
 
 ## Quick Start
 
@@ -49,11 +88,12 @@ dependencies: [
     name: "YourApp",
     dependencies: [
         .product(name: "SwiftHarnessAgent", package: "SwiftHarnessAgent")
+        // or .product(name: "SwiftAISDK", package: "SwiftHarnessAgent") for client-only
     ]
 )
 ```
 
-**3. Run the snippet above** — `EchoModel` needs no API key, so the agent boots immediately. Swap it for a real backend when you are ready (see [Recipes](#recipes)).
+**3. Run the snippet above** — `EchoClient` needs no API key, so the agent boots immediately. Swap it for a real backend when you are ready (see [Recipes](#recipes)).
 
 ## How it differs
 
@@ -74,33 +114,19 @@ dependencies: [
 
 The two are not really competitors — SwiftAgent treats LLMs as a declarative computation primitive; SwiftHarnessAgent treats them as the brain of an autonomous tool-using agent.
 
-## What's in the box
-
-- `AgentSDK` — main entry, assembles model + tools + policy + skills + compaction
-- `AgentLoop` — the multi-step reasoning loop
-- `AgentModel` protocol — implement for any backend
-- `OpenAICompatibleChatModel` / `AnthropicChatModel` / `EchoModel`
-- `ToolExecutionPolicy` — file allow-roots and bash sandboxing (disabled / sandboxed / unrestricted)
-- `ReadTool` / `WriteTool` / `EditTool` / `BashTool`
-- `TodoStore` + `TodoWriteTool` — phased task tracking with a live `phasesStream()`
-- `AskTool` — interactive user prompts via an `AskHandler` closure
-- `TaskCoordinator` + `SubagentDefinition` — parallel subagent fan-out
-- `SkillLoader` — load `SKILL.md` directories into reusable skill definitions
-- `CompactionConfig` — summarize older context to keep long histories bounded
-
 ## Recipes
 
-### OpenAI-compatible backends
+### OpenAI Chat Completions (and compatible endpoints)
 
 ```swift
-let model = OpenAICompatibleChatModel(
+let client = OpenAIChatCompletionsClient(
     baseURL: URL(string: "https://api.openai.com/v1")!,
-    apiKey: ProcessInfo.processInfo.environment["OPENAI_API_KEY"],
-    modelName: "gpt-4o"
+    apiKey: ProcessInfo.processInfo.environment["OPENAI_API_KEY"]
 )
 
 let agent = AgentSDK(
-    model: model,
+    client: client,
+    modelName: "gpt-4o",
     workingDirectory: workspace,
     executionPolicy: ToolExecutionPolicy(
         workingDirectory: workspace,
@@ -110,20 +136,44 @@ let agent = AgentSDK(
 )
 ```
 
-### Anthropic (native Messages API with `tool_use` / `tool_result`)
+Works with OpenAI, NVIDIA NIM, vLLM, sglang, Ollama's OpenAI shim, Together, Groq, and any other `/v1/chat/completions` endpoint.
+
+### OpenAI Responses API (with reasoning persistence)
 
 ```swift
-let model = AnthropicChatModel(
-    apiKey: ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"],
-    modelName: "claude-sonnet-4-5"
+let client = OpenAIResponsesClient(
+    baseURL: URL(string: "https://api.openai.com/v1")!,
+    apiKey: ProcessInfo.processInfo.environment["OPENAI_API_KEY"],
+    includeEncryptedReasoning: true
 )
 
 let agent = AgentSDK(
-    model: model,
+    client: client,
+    modelName: "gpt-5.2",
+    workingDirectory: workspace,
+    executionPolicy: ToolExecutionPolicy(workingDirectory: workspace)
+)
+```
+
+The Responses API is OpenAI's newer protocol with reasoning persistence and server-side state. Set `includeEncryptedReasoning: true` to thread reasoning across turns (required for o1 / o3 / gpt-5 style models when you want reasoning continuity).
+
+### Anthropic Messages API (with extended thinking)
+
+```swift
+let client = AnthropicMessagesClient(
+    apiKey: ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"],
+    thinkingBudgetTokens: 10_000  // enable extended thinking with 10k token budget
+)
+
+let agent = AgentSDK(
+    client: client,
+    modelName: "claude-sonnet-4-6",
     workingDirectory: workspace,
     executionPolicy: ToolExecutionPolicy(workingDirectory: workspace, bash: .disabled)
 )
 ```
+
+Extended thinking blocks with signatures are automatically preserved across turns (required for Anthropic extended-thinking + tool-use multi-turn correctness).
 
 ### Custom tool
 
@@ -139,7 +189,8 @@ struct CurrentTimeTool: AgentTool {
 }
 
 let agent = AgentSDK(
-    model: model,
+    client: client,
+    modelName: "gpt-4o",
     tools: [CurrentTimeTool()],
     workingDirectory: workspace,
     executionPolicy: ToolExecutionPolicy(workingDirectory: workspace)
@@ -150,7 +201,8 @@ let agent = AgentSDK(
 
 ```swift
 let agent = AgentSDK(
-    model: model,
+    client: client,
+    modelName: "gpt-4o",
     workingDirectory: workspace,
     executionPolicy: ToolExecutionPolicy(workingDirectory: workspace),
     skillsDirectories: [URL(fileURLWithPath: "/path/to/.skills")]
@@ -189,11 +241,13 @@ let explorer = SubagentDefinition(
 
 let coordinator = TaskCoordinator(
     definitions: [explorer],
-    modelFactory: { _ in
-        OpenAICompatibleChatModel(
-            baseURL: URL(string: "https://api.openai.com/v1")!,
-            apiKey: ProcessInfo.processInfo.environment["OPENAI_API_KEY"],
-            modelName: "gpt-4o-mini"
+    clientFactory: { _ in
+        (
+            OpenAIChatCompletionsClient(
+                baseURL: URL(string: "https://api.openai.com/v1")!,
+                apiKey: ProcessInfo.processInfo.environment["OPENAI_API_KEY"]
+            ),
+            "gpt-4o-mini"
         )
     },
     workingDirectory: workspace,
@@ -202,7 +256,8 @@ let coordinator = TaskCoordinator(
 )
 
 let agent = AgentSDK(
-    model: model,
+    client: client,
+    modelName: "gpt-4o",
     workingDirectory: workspace,
     executionPolicy: ToolExecutionPolicy(workingDirectory: workspace),
     todoStore: todoStore,
@@ -215,17 +270,46 @@ Subagents inherit the parent's working directory and execution policy. Each task
 
 ## Core Concepts
 
-- **`AgentSDK`** — assembles the model, tools, skills, execution policy, working directory, and compaction settings into a runnable agent.
-- **Models** — implement `AgentModel` for your own backend, or use `OpenAICompatibleChatModel` / `AnthropicChatModel` / `EchoModel`.
+- **`AgentSDK`** — assembles the client, model name, tools, skills, execution policy, working directory, and compaction settings into a runnable agent.
+- **`LLMClient`** — implement for your own backend, or use `OpenAIChatCompletionsClient` / `OpenAIResponsesClient` / `AnthropicMessagesClient` / `EchoClient`.
 - **Tools** — implement `AgentTool` to expose capabilities. Every tool runs with a `ToolExecutionContext` carrying the working directory and the effective execution policy.
 - **`ToolExecutionPolicy`** — separates file access (scoped via allowed roots) from shell execution (`disabled`, sandboxed via `sandbox-exec`, or unrestricted). `read` caps file size by default to keep tool output from blowing past the model's context window.
 - **`SkillLoader`** — scans directories for `SKILL.md` files and turns them into reusable skill definitions injected into the agent.
 - **`CompactionConfig`** — summarize older turns before context grows out of bounds, so long-running conversations stay tractable.
 
+
+### Parallel Tool Calls (Barrier Scheduler)
+
+When `parallelToolCalls: true` is set in `AgentLoopConfig`, the agent loop uses a barrier-based scheduler inspired by oh-my-pi:
+
+- **`.shared` tools** (default — `read`, `search`, `find`, `ast_grep`) run concurrently within a batch.
+- **`.exclusive` tools** (`write`, `edit`, `bash`, `todo_write`) act as barriers: the pending shared batch drains first, then the exclusive tool runs alone, then accumulation resumes.
+- **Results** always return in the original tool_use order.
+
+```swift
+let config = AgentLoopConfig(
+    workingDirectory: workspace,
+    parallelToolCalls: true  // Enable barrier scheduler
+)
+```
+
+Custom tools opt into the right mode via the `concurrency` property:
+
+```swift
+struct MyReadOnlyTool: AgentTool {
+    // ...
+    var concurrency: ToolConcurrency { .shared }    // default, can omit
+}
+
+struct MyWriteTool: AgentTool {
+    // ...
+    var concurrency: ToolConcurrency { .exclusive } // serialized
+}
+```
 ## Non-Goals
 
 - **Not a UI framework.** Bring your own SwiftUI / AppKit / UIKit layer — `TodoStore.phasesStream()` and `AskHandler` exist precisely so the runtime stays headless.
-- **Not a single-shot LLM SDK.** For `client.chat(...)`-style calls, a thinner library will serve you better.
+- **Not a single-shot LLM SDK.** For `client.chat(...)`-style calls, a thinner library will serve you better (or use `SwiftAISDK` directly).
 - **Not a declarative DSL.** If you want `body { Transform; GenerateText; ... }`, see [SwiftAgent](https://github.com/1amageek/SwiftAgent).
 - **`bash` is macOS-only** (uses `sandbox-exec`). On other platforms it raises an explicit error rather than silently downgrading sandboxing.
 
@@ -235,6 +319,8 @@ Subagents inherit the parent's working directory and execution policy. Each task
 swift test
 swift run SwiftHarnessAgentExample
 ```
+
+All 67 tests pass.
 
 ## Star History
 

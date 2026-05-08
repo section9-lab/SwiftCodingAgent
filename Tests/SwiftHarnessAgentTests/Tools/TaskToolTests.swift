@@ -2,11 +2,6 @@ import Testing
 @testable import SwiftHarnessAgent
 import Foundation
 
-/// A scripted model that replays a fixed sequence of responses. Each call to
-/// `generate` advances the cursor; the same model instance is shared across
-/// multiple subagent loops, but the responses for each loop are short enough
-/// (one assistant reply, no tool calls) that we don't have to track per-loop
-/// state.
 private actor SequenceState {
     var index = 0
     func next() -> Int {
@@ -16,22 +11,34 @@ private actor SequenceState {
     }
 }
 
-private struct ScriptedModel: AgentModel {
-    let responses: [ModelResponse]
+/// Scripted LLM client that replays a fixed list of responses. One instance
+/// per subagent spawn; the shared coordinator factory below builds a fresh
+/// one each time so the cursor always starts at zero.
+private struct ScriptedClient: LLMClient {
+    let responses: [LLMResponse]
     let state = SequenceState()
 
-    func generate(request: ModelRequest) async throws -> ModelResponse {
+    func complete(_ request: LLMRequest) async throws -> LLMResponse {
         let i = await state.next()
         if i < responses.count { return responses[i] }
-        return ModelResponse(content: "done")
+        return LLMResponse(
+            message: LLMMessage(role: .assistant, content: [.text("done")]),
+            stopReason: .endTurn
+        )
     }
 }
 
-/// Each subagent gets its own fresh ScriptedModel via the factory, so the
-/// per-subagent cursor starts at 0 every time.
-private func makeFactory(answer: String) -> @Sendable (SubagentDefinition) -> any AgentModel {
+private func makeFactory(answer: String) -> @Sendable (SubagentDefinition) -> (any LLMClient, String) {
     return { _ in
-        ScriptedModel(responses: [ModelResponse(content: answer)])
+        (
+            ScriptedClient(responses: [
+                LLMResponse(
+                    message: LLMMessage(role: .assistant, content: [.text(answer)]),
+                    stopReason: .endTurn
+                )
+            ]),
+            "scripted-model"
+        )
     }
 }
 
@@ -56,7 +63,7 @@ struct TaskToolTests {
 
         let coordinator = TaskCoordinator(
             definitions: [agent],
-            modelFactory: makeFactory(answer: "investigation summary"),
+            clientFactory: makeFactory(answer: "investigation summary"),
             workingDirectory: URL(fileURLWithPath: "/tmp"),
             executionPolicy: ToolExecutionPolicy(allowedRoots: [URL(fileURLWithPath: "/tmp")], bash: .disabled),
             maxConcurrency: 2
@@ -76,7 +83,6 @@ struct TaskToolTests {
 
         let output = try await tool.run(argumentsJSON: json, context: makeContext())
 
-        // Order is preserved by index, not by completion time.
         let authLoaderRange = output.range(of: "Task AuthLoader")
         let authRouterRange = output.range(of: "Task AuthRouter")
         #expect(authLoaderRange != nil)
@@ -99,7 +105,7 @@ struct TaskToolTests {
         )
         let coordinator = TaskCoordinator(
             definitions: [known],
-            modelFactory: makeFactory(answer: "ok"),
+            clientFactory: makeFactory(answer: "ok"),
             workingDirectory: URL(fileURLWithPath: "/tmp"),
             executionPolicy: ToolExecutionPolicy(allowedRoots: [URL(fileURLWithPath: "/tmp")], bash: .disabled)
         )
@@ -122,7 +128,7 @@ struct TaskToolTests {
     func duplicateTaskIDsFailValidation() async {
         let coordinator = TaskCoordinator(
             definitions: [],
-            modelFactory: makeFactory(answer: ""),
+            clientFactory: makeFactory(answer: ""),
             workingDirectory: URL(fileURLWithPath: "/tmp"),
             executionPolicy: ToolExecutionPolicy(allowedRoots: [URL(fileURLWithPath: "/tmp")], bash: .disabled)
         )
@@ -145,7 +151,7 @@ struct TaskToolTests {
     func emptyAssignmentFailsValidation() async {
         let coordinator = TaskCoordinator(
             definitions: [],
-            modelFactory: makeFactory(answer: ""),
+            clientFactory: makeFactory(answer: ""),
             workingDirectory: URL(fileURLWithPath: "/tmp"),
             executionPolicy: ToolExecutionPolicy(allowedRoots: [URL(fileURLWithPath: "/tmp")], bash: .disabled)
         )

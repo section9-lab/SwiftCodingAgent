@@ -8,6 +8,10 @@ let package = Package(
         .iOS(.v17)
     ],
     products: [
+        // Provider-agnostic LLM client layer. Use this directly if you only
+        // want OpenAI / Anthropic API access without the agent runtime.
+        .library(name: "SwiftAISDK", targets: ["SwiftAISDK"]),
+        // Coding-agent runtime built on top of SwiftAISDK.
         .library(name: "SwiftHarnessAgent", targets: ["SwiftHarnessAgent"]),
         .executable(name: "SwiftHarnessAgentExample", targets: ["SwiftHarnessAgentExample"])
     ],
@@ -20,15 +24,25 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "SwiftHarnessAgent",
+            name: "SwiftAISDK",
             dependencies: [
                 .product(name: "EventSource", package: "EventSource")
             ],
+            path: "Sources/SwiftAISDK"
+        ),
+        .target(
+            name: "SwiftHarnessAgent",
+            dependencies: ["SwiftAISDK"],
             path: "Sources/SwiftHarnessAgent"
         ),
         .testTarget(
+            name: "SwiftAISDKTests",
+            dependencies: ["SwiftAISDK"],
+            path: "Tests/SwiftAISDKTests"
+        ),
+        .testTarget(
             name: "SwiftHarnessAgentTests",
-            dependencies: ["SwiftHarnessAgent"],
+            dependencies: ["SwiftHarnessAgent", "SwiftAISDK"],
             path: "Tests/SwiftHarnessAgentTests"
         ),
         .executableTarget(

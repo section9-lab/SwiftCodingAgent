@@ -2,11 +2,15 @@ import Foundation
 
 /// Parses Server-Sent Events from a streaming HTTP body.
 ///
-/// Both OpenAI and Anthropic streaming responses are SSE: each event is a set
-/// of `field: value` lines terminated by a blank line. We only care about the
-/// `data:` field; multiple `data:` lines in one event are joined with `\n`.
+/// All three of OpenAI Chat Completions, OpenAI Responses, and Anthropic
+/// Messages stream over SSE: each event is a set of `field: value` lines
+/// terminated by a blank line. We only care about the `data:` field; multiple
+/// `data:` lines in one event are joined with `\n`.
 ///
-/// Sentinel `data: [DONE]` (OpenAI) is reported verbatim so callers can stop.
+/// The OpenAI Responses stream additionally puts the typed event name in an
+/// `event:` line — we keep that behaviour out of this parser (callers parse
+/// the JSON `type` field themselves), so the parser stays a single concern:
+/// raw SSE framing.
 ///
 /// We work at the UTF-8 byte level for line splitting because Swift treats
 /// `\r\n` as a single extended grapheme cluster — `String.range(of: "\n")`
@@ -19,7 +23,7 @@ struct SSEParser {
     private static let cr: UInt8 = 0x0D
 
     /// Feed raw text and return any complete data payloads now available.
-    /// Each element is a JSON string (or `[DONE]` for OpenAI).
+    /// Each element is a JSON string (or `[DONE]` for OpenAI Chat Completions).
     mutating func feed(_ chunk: String) -> [String] {
         buffer.append(contentsOf: chunk.utf8)
         var events: [String] = []

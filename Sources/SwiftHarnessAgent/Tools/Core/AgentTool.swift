@@ -1,5 +1,13 @@
 import Foundation
 
+/// Defines how a tool can be executed relative to other tools in the same turn.
+public enum ToolConcurrency: String, Sendable {
+    /// Can run in parallel with other shared tools.
+    case shared
+    /// Must run exclusively; other tools wait for it to complete.
+    case exclusive
+}
+
 public struct ToolExecutionContext: Sendable {
     public let workingDirectory: URL
     public let executionPolicy: ToolExecutionPolicy
@@ -78,8 +86,15 @@ public protocol AgentTool: Sendable {
     var name: String { get }
     var description: String { get }
     var argumentSchemaJSON: String { get }
+    /// Concurrency mode. Defaults to `.shared` (safe for parallel execution).
+    var concurrency: ToolConcurrency { get }
 
     func run(argumentsJSON: String, context: ToolExecutionContext) async throws -> String
+}
+
+// Default implementation: most tools are read-only and safe to parallelize.
+extension AgentTool {
+    public var concurrency: ToolConcurrency { .shared }
 }
 
 public enum ToolError: LocalizedError {
@@ -121,17 +136,25 @@ public actor ToolRegistry {
         }
     }
 
-    public func allSpecs() -> [ModelToolSpec] {
+    public func allSpecs() -> [LLMToolSpec] {
         tools.values
-            .map { ModelToolSpec(name: $0.name, description: $0.description, argumentSchemaJSON: $0.argumentSchemaJSON) }
+            .map { LLMToolSpec(name: $0.name, description: $0.description, argumentSchemaJSON: $0.argumentSchemaJSON) }
             .sorted { $0.name < $1.name }
     }
 
-    public func run(call: ToolCall, context: ToolExecutionContext) async throws -> String {
-        guard let tool = tools[call.name] else {
-            throw ToolError.toolNotFound(call.name)
+    /// Returns the declared concurrency for a tool, or `.shared` (the safe
+    /// default) when the tool isn't registered. The fallback never matters in
+    /// practice — callers always check registration before scheduling — but
+    /// keeps the contract total.
+    public func concurrency(for toolName: String) -> ToolConcurrency {
+        tools[toolName]?.concurrency ?? .shared
+    }
+
+    public func run(use: LLMToolUse, context: ToolExecutionContext) async throws -> String {
+        guard let tool = tools[use.name] else {
+            throw ToolError.toolNotFound(use.name)
         }
-        return try await tool.run(argumentsJSON: call.argumentsJSON, context: context)
+        return try await tool.run(argumentsJSON: use.argumentsJSON, context: context)
     }
 }
 

@@ -38,6 +38,8 @@ public struct BashTool: AgentTool {
         #endif
     }
 
+    public var concurrency: ToolConcurrency { .exclusive }
+
     #if os(macOS)
     private func runCommand(
         _ command: String,

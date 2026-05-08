@@ -73,18 +73,23 @@ public struct SubagentTaskResult: Sendable {
 /// Spawns subagents on demand. Owns the model factory and execution policy
 /// used to build each child loop, so callers (including `TaskTool`) only need
 /// to supply the request payload.
+///
+/// `clientFactory` returns both the `LLMClient` and the model name to use for
+/// the spawned loop. This lets a host route different subagents to different
+/// providers (e.g. read-only explorer on a cheap fast model, writer on a
+/// stronger model).
 public actor TaskCoordinator {
-    public typealias ModelFactory = @Sendable (SubagentDefinition) -> any AgentModel
+    public typealias ClientFactory = @Sendable (SubagentDefinition) -> (any LLMClient, String)
 
     private let definitions: [String: SubagentDefinition]
-    private let modelFactory: ModelFactory
+    private let clientFactory: ClientFactory
     private let workingDirectory: URL
     private let executionPolicy: ToolExecutionPolicy
     private let maxConcurrency: Int
 
     public init(
         definitions: [SubagentDefinition],
-        modelFactory: @escaping ModelFactory,
+        clientFactory: @escaping ClientFactory,
         workingDirectory: URL,
         executionPolicy: ToolExecutionPolicy,
         maxConcurrency: Int = 4
@@ -94,7 +99,7 @@ public actor TaskCoordinator {
             byID[def.id] = def
         }
         self.definitions = byID
-        self.modelFactory = modelFactory
+        self.clientFactory = clientFactory
         self.workingDirectory = workingDirectory
         self.executionPolicy = executionPolicy
         self.maxConcurrency = max(1, maxConcurrency)
@@ -158,14 +163,15 @@ public actor TaskCoordinator {
             )
         }
 
-        let model = modelFactory(definition)
+        let (client, modelName) = clientFactory(definition)
         var skills: [any AgentSkill] = definition.skills
         if !definition.systemPrompt.isEmpty {
             skills.insert(BasicSkill(name: "subagent.\(definition.id)", systemPrompt: definition.systemPrompt), at: 0)
         }
 
         let loop = AgentLoop(
-            model: model,
+            client: client,
+            modelName: modelName,
             skills: skills,
             tools: definition.tools,
             config: AgentLoopConfig(

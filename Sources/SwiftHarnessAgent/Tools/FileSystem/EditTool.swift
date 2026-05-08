@@ -9,6 +9,8 @@ public struct EditTool: AgentTool {
 
     public init() {}
 
+    public var concurrency: ToolConcurrency { .exclusive }
+
     public func run(argumentsJSON: String, context: ToolExecutionContext) async throws -> String {
         struct Args: Decodable {
             let path: String

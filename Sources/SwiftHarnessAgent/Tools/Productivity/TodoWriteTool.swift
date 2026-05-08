@@ -11,6 +11,8 @@ public struct TodoWriteTool: AgentTool {
     {"type":"object","properties":{"ops":{"type":"array","minItems":1,"items":{"type":"object","properties":{"op":{"type":"string","enum":["init","start","done","rm","drop","append","note"]},"task":{"type":"string"},"phase":{"type":"string"},"text":{"type":"string"},"items":{"type":"array","items":{"type":"string"}},"list":{"type":"array","items":{"type":"object","properties":{"phase":{"type":"string"},"items":{"type":"array","items":{"type":"string"}}},"required":["phase","items"]}}},"required":["op"]}}},"required":["ops"]}
     """
 
+    public var concurrency: ToolConcurrency { .exclusive }
+
     private let store: TodoStore
 
     public init(store: TodoStore, description: String? = nil) {

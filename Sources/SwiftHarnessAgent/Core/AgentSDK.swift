@@ -4,8 +4,10 @@ public actor AgentSDK {
     private let loop: AgentLoop
 
     public init(
-        model: any AgentModel,
-        summarizerModel: (any AgentModel)? = nil,
+        client: any LLMClient,
+        modelName: String,
+        summarizer: (any LLMClient)? = nil,
+        summarizerModelName: String? = nil,
         skills: [any AgentSkill] = [],
         tools: [any AgentTool] = [],
         workingDirectory: URL,
@@ -42,8 +44,10 @@ public actor AgentSDK {
         }
 
         self.loop = AgentLoop(
-            model: model,
-            summarizerModel: summarizerModel,
+            client: client,
+            modelName: modelName,
+            summarizer: summarizer,
+            summarizerModelName: summarizerModelName,
             skills: allSkills,
             tools: builtinTools + tools,
             config: AgentLoopConfig(
@@ -68,7 +72,7 @@ public actor AgentSDK {
         loop.runStream(userInput: prompt)
     }
 
-    public func history() async -> [AgentMessage] {
+    public func history() async -> [LLMMessage] {
         await loop.history()
     }
 

@@ -49,11 +49,11 @@ public struct AgentLoopConfig: Sendable {
 
 public struct AgentRunResult: Sendable {
     public let finalText: String
-    public let messages: [AgentMessage]
+    public let messages: [LLMMessage]
     public let steps: Int
     public let compactionSummary: String?
 
-    public init(finalText: String, messages: [AgentMessage], steps: Int, compactionSummary: String?) {
+    public init(finalText: String, messages: [LLMMessage], steps: Int, compactionSummary: String?) {
         self.finalText = finalText
         self.messages = messages
         self.steps = steps
@@ -69,23 +69,22 @@ public struct AgentRunResult: Sendable {
 public enum AgentEvent: Sendable {
     /// A new step is starting (about to call the model). 1-indexed.
     case stepStarted(Int)
-    /// Incremental assistant text from the current step. Concatenate to build
-    /// the full text for that step.
+    /// Incremental assistant text from the current step.
     case textDelta(String)
-    /// Incremental fragment of model "reasoning" / chain-of-thought (sourced
-    /// from `reasoning_content` on OpenAI-style streams, or comparable
-    /// channels on other providers). Forwarded as a separate event so callers
-    /// can render it in a collapsed/dimmed pane without mixing it into the
-    /// final answer. Reasoning is *not* persisted into the assistant message
-    /// — it only exists during the live stream.
+    /// Incremental fragment of model "reasoning" / chain-of-thought. Forwarded
+    /// as a separate event so callers can render it in a collapsed/dimmed
+    /// pane without mixing it into the final answer. Reasoning blocks WITH
+    /// signatures are persisted into the assistant message (required for
+    /// Anthropic extended-thinking + tool-use multi-turn correctness);
+    /// reasoning without a signature is transient UI state only.
     case reasoningDelta(String)
     /// The assistant turn finished. `text` is the full assembled text for the
-    /// step; `toolCalls` is empty if no tools were requested.
-    case assistantTurn(text: String, toolCalls: [ToolCall])
+    /// step; `toolUses` is empty if no tools were requested.
+    case assistantTurn(text: String, toolUses: [LLMToolUse])
     /// A tool is about to start executing.
-    case toolStarted(ToolCall)
+    case toolStarted(LLMToolUse)
     /// A tool finished executing.
-    case toolFinished(ToolResult)
+    case toolFinished(LLMToolResult)
     /// The agent loop has finished. Mirrors the result `run` returns.
     case completed(AgentRunResult)
 }
@@ -106,14 +105,15 @@ public actor AgentLoop {
         let index: Int
     }
 
-    private let model: any AgentModel
-    /// Model used to summarise older history. Defaults to `model` if no
-    /// dedicated summariser was provided (a smaller / cheaper model is often a
-    /// good fit for this — see AgentSDK's `summarizerModel` parameter).
-    private let summarizer: any AgentModel
+    private let client: any LLMClient
+    private let modelName: String
+    /// Client used to summarise older history. Defaults to `client` if no
+    /// dedicated summariser was provided.
+    private let summarizer: any LLMClient
+    private let summarizerModelName: String
     private let toolRegistry: ToolRegistry
     private let config: AgentLoopConfig
-    private var messages: [AgentMessage]
+    private var messages: [LLMMessage]
 
     /// Messages in the [0..<immutablePrefixCount] range are never compacted
     /// and are sent verbatim on every request. Initially this covers skill
@@ -123,28 +123,30 @@ public actor AgentLoop {
     private var firstKeptMessageIndex: Int
     private var compactionSummary: String?
     private var firstUserMessageAnchored = false
-    /// Last input-token count reported by the model. We trust this over any
-    /// estimator: it's exact, post-cache, and matches what the provider bills.
+    /// Last input-token count reported by the model.
     private var lastReportedInputTokens: Int?
-    /// Counts consecutive failed compaction attempts. After enough failures
-    /// we force-drop the oldest turn instead of looping forever.
+    /// Counts consecutive failed compaction attempts.
     private var consecutiveCompactionFailures = 0
 
     public init(
-        model: any AgentModel,
-        summarizerModel: (any AgentModel)? = nil,
+        client: any LLMClient,
+        modelName: String,
+        summarizer: (any LLMClient)? = nil,
+        summarizerModelName: String? = nil,
         skills: [any AgentSkill] = [],
         tools: [any AgentTool] = [],
         config: AgentLoopConfig
     ) {
-        self.model = model
-        self.summarizer = summarizerModel ?? model
+        self.client = client
+        self.modelName = modelName
+        self.summarizer = summarizer ?? client
+        self.summarizerModelName = summarizerModelName ?? modelName
         self.config = config
 
         let skillTools = skills.flatMap { $0.tools }
         self.toolRegistry = ToolRegistry(tools: tools + skillTools)
 
-        var seedMessages: [AgentMessage] = []
+        var seedMessages: [LLMMessage] = []
         for skill in skills where !skill.systemPrompt.isEmpty {
             seedMessages.append(.system("[Skill: \(skill.name)]\n\(skill.systemPrompt)"))
         }
@@ -155,7 +157,7 @@ public actor AgentLoop {
         self.compactionSummary = nil
     }
 
-    public func history() -> [AgentMessage] {
+    public func history() -> [LLMMessage] {
         messages
     }
 
@@ -187,56 +189,49 @@ public actor AgentLoop {
 
             try await maybeCompact()
 
-            let request = ModelRequest(
+            let request = LLMRequest(
+                model: modelName,
                 messages: makeRequestMessages(),
                 tools: await makeRequestTools()
             )
 
-            let response = try await model.generate(request: request)
+            let response = try await client.complete(request)
             recordUsage(response.usage)
 
-            // Persist the assistant turn as a single message carrying both the
-            // textual response and any tool calls. This matches both OpenAI's
-            // tool_calls array and Anthropic's tool_use blocks.
-            if !response.content.isEmpty || !response.toolCalls.isEmpty {
-                messages.append(
-                    AgentMessage(
-                        role: .assistant,
-                        text: response.content,
-                        toolCalls: response.toolCalls
-                    )
-                )
+            // Persist the assistant turn verbatim — including any reasoning
+            // blocks with signatures (required for Anthropic extended-thinking
+            // + tool_use multi-turn correctness).
+            if !response.message.content.isEmpty {
+                messages.append(response.message)
             }
 
-            if response.toolCalls.isEmpty {
+            let toolUses = response.message.toolUses
+
+            if toolUses.isEmpty {
                 return AgentRunResult(
-                    finalText: response.content,
+                    finalText: response.message.text,
                     messages: messages,
                     steps: step,
                     compactionSummary: compactionSummary
                 )
             }
 
-            let results = try await runToolCalls(response.toolCalls)
+            let results = try await runToolCalls(toolUses)
 
             // Append all tool results in a single tool-role message so they
             // travel together, mirroring Anthropic's "tool_result blocks in one
-            // user turn" expectation. The OpenAI adapter splits this back into
-            // individual tool messages on the wire.
-            messages.append(
-                AgentMessage(role: .tool, toolResults: results)
-            )
+            // user turn" expectation. The OpenAI adapters split this back into
+            // individual items on the wire.
+            messages.append(LLMMessage(
+                role: .tool,
+                content: results.map { LLMContentBlock.toolResult($0) }
+            ))
         }
 
         throw AgentLoopError.maxStepsReached
     }
 
     /// Streamed variant of `run`.
-    ///
-    /// AI text is delivered incrementally as `.textDelta` events while it
-    /// arrives over the wire. Tool calls and tool results are delivered as
-    /// complete units (no partial JSON) — tools themselves run in batches as
-    /// before. Terminates with `.completed(AgentRunResult)` or by throwing.
     public nonisolated func runStream(userInput: String) -> AsyncThrowingStream<AgentEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -265,48 +260,44 @@ public actor AgentLoop {
 
             try await maybeCompact()
 
-            let request = ModelRequest(
+            let request = LLMRequest(
+                model: modelName,
                 messages: makeRequestMessages(),
                 tools: await makeRequestTools()
             )
 
-            // Drive the model's stream and forward text deltas verbatim. Tool
-            // calls are buffered by the adapter and arrive as whole objects.
+            // Drive the model's stream. Forward text + reasoning deltas
+            // verbatim; assemble the final message from the messageStop event.
+            var stepMessage: LLMMessage?
             var stepText = ""
-            var stepToolCalls: [ToolCall] = []
+            var stepToolUses: [LLMToolUse] = []
 
-            for try await event in model.stream(request: request) {
+            for try await event in client.stream(request) {
                 switch event {
+                case .messageStart, .blockStart, .blockStop:
+                    break
                 case .textDelta(let delta):
-                    stepText += delta
                     continuation.yield(.textDelta(delta))
-                case .reasoningDelta(let delta):
-                    // Reasoning is forwarded but not folded into the
-                    // persisted assistant message — it's transient UI state.
-                    continuation.yield(.reasoningDelta(delta))
-                case .toolCall(let call):
-                    stepToolCalls.append(call)
-                case .completed(let response):
-                    // Adapters that fall back to non-streaming `generate` will
-                    // surface text only here. Take whichever is non-empty.
-                    if stepText.isEmpty { stepText = response.content }
-                    if stepToolCalls.isEmpty { stepToolCalls = response.toolCalls }
+                case .reasoningDelta(let payload):
+                    continuation.yield(.reasoningDelta(payload.delta))
+                case .toolArgumentsDelta:
+                    // Suppressed at this layer — we expose tool_use as a
+                    // single event when the call is complete.
+                    break
+                case .messageStop(let response):
+                    stepMessage = response.message
+                    stepText = response.message.text
+                    stepToolUses = response.message.toolUses
                     recordUsage(response.usage)
                 }
             }
 
-            if !stepText.isEmpty || !stepToolCalls.isEmpty {
-                messages.append(
-                    AgentMessage(
-                        role: .assistant,
-                        text: stepText,
-                        toolCalls: stepToolCalls
-                    )
-                )
+            if let stepMessage, !stepMessage.content.isEmpty {
+                messages.append(stepMessage)
             }
-            continuation.yield(.assistantTurn(text: stepText, toolCalls: stepToolCalls))
+            continuation.yield(.assistantTurn(text: stepText, toolUses: stepToolUses))
 
-            if stepToolCalls.isEmpty {
+            if stepToolUses.isEmpty {
                 let result = AgentRunResult(
                     finalText: stepText,
                     messages: messages,
@@ -318,49 +309,105 @@ public actor AgentLoop {
                 return
             }
 
-            // Announce + run tools in batch (mirrors `run`).
-            for call in stepToolCalls { continuation.yield(.toolStarted(call)) }
-            let results = try await runToolCalls(stepToolCalls)
+            for use in stepToolUses { continuation.yield(.toolStarted(use)) }
+            let results = try await runToolCalls(stepToolUses)
             for result in results { continuation.yield(.toolFinished(result)) }
 
-            messages.append(
-                AgentMessage(role: .tool, toolResults: results)
-            )
+            messages.append(LLMMessage(
+                role: .tool,
+                content: results.map { LLMContentBlock.toolResult($0) }
+            ))
         }
 
         throw AgentLoopError.maxStepsReached
     }
 
-    private func runToolCalls(_ calls: [ToolCall]) async throws -> [ToolResult] {
-        if config.parallelToolCalls && calls.count > 1 {
-            return try await withThrowingTaskGroup(of: (Int, ToolResult).self) { group in
-                for (index, call) in calls.enumerated() {
-                    let context = config.context(for: call.name)
-                    let registry = toolRegistry
+    /// Schedule tool calls according to each tool's `concurrency` declaration.
+    ///
+    /// When `parallelToolCalls` is enabled, this implements an oh-my-pi-style
+    /// barrier scheduler:
+    /// - `.shared` tools accumulate into a batch and run concurrently.
+    /// - `.exclusive` tools act as barriers: the pending shared batch drains
+    ///   first, then the exclusive tool runs alone, then accumulation resumes.
+    ///
+    /// Results are returned in the original `uses` order regardless of the
+    /// completion order, so the assistant message stays consistent with the
+    /// model's tool_use sequence.
+    ///
+    /// When `parallelToolCalls` is disabled (the default for backward
+    /// compatibility), all tools run strictly sequentially.
+    internal func runToolCalls(_ uses: [LLMToolUse]) async throws -> [LLMToolResult] {
+        guard config.parallelToolCalls && uses.count > 1 else {
+            return try await runSequentially(uses)
+        }
+
+        // Resolve concurrency for every call up front. Unknown tools default
+        // to `.shared` — the actual error surfaces inside `executeTool` when
+        // the registry lookup fails.
+        var concurrencies: [ToolConcurrency] = []
+        concurrencies.reserveCapacity(uses.count)
+        for use in uses {
+            concurrencies.append(await toolRegistry.concurrency(for: use.name))
+        }
+
+        var results: [LLMToolResult?] = Array(repeating: nil, count: uses.count)
+        var sharedBatch: [(Int, LLMToolUse)] = []
+
+        func drainSharedBatch() async {
+            guard !sharedBatch.isEmpty else { return }
+            let batch = sharedBatch
+            sharedBatch.removeAll(keepingCapacity: true)
+            let registry = toolRegistry
+            let cfg = config
+            await withTaskGroup(of: (Int, LLMToolResult).self) { group in
+                for (index, use) in batch {
+                    let context = cfg.context(for: use.name)
                     group.addTask {
                         let result = await Self.executeTool(
-                            call: call,
+                            use: use,
                             context: context,
                             registry: registry
                         )
                         return (index, result)
                     }
                 }
-
-                var collected: [(Int, ToolResult)] = []
-                for try await item in group {
-                    collected.append(item)
+                for await (index, result) in group {
+                    results[index] = result
                 }
-                return collected.sorted { $0.0 < $1.0 }.map { $0.1 }
             }
         }
 
-        var results: [ToolResult] = []
-        results.reserveCapacity(calls.count)
-        for call in calls {
-            let context = config.context(for: call.name)
+        for (index, use) in uses.enumerated() {
+            try Task.checkCancellation()
+            switch concurrencies[index] {
+            case .shared:
+                sharedBatch.append((index, use))
+            case .exclusive:
+                await drainSharedBatch()
+                let context = config.context(for: use.name)
+                let result = await Self.executeTool(
+                    use: use,
+                    context: context,
+                    registry: toolRegistry
+                )
+                results[index] = result
+            }
+        }
+        await drainSharedBatch()
+
+        // Every slot must be filled by construction; force-unwrap surfaces a
+        // scheduler bug rather than papering over it.
+        return results.map { $0! }
+    }
+
+    private func runSequentially(_ uses: [LLMToolUse]) async throws -> [LLMToolResult] {
+        var results: [LLMToolResult] = []
+        results.reserveCapacity(uses.count)
+        for use in uses {
+            try Task.checkCancellation()
+            let context = config.context(for: use.name)
             let result = await Self.executeTool(
-                call: call,
+                use: use,
                 context: context,
                 registry: toolRegistry
             )
@@ -370,22 +417,22 @@ public actor AgentLoop {
     }
 
     private static func executeTool(
-        call: ToolCall,
+        use: LLMToolUse,
         context: ToolExecutionContext,
         registry: ToolRegistry
-    ) async -> ToolResult {
+    ) async -> LLMToolResult {
         do {
-            let output = try await registry.run(call: call, context: context)
-            return ToolResult(
-                toolCallID: call.id,
-                toolName: call.name,
+            let output = try await registry.run(use: use, context: context)
+            return LLMToolResult(
+                toolUseID: use.id,
+                toolName: use.name,
                 content: output,
                 isError: false
             )
         } catch {
-            return ToolResult(
-                toolCallID: call.id,
-                toolName: call.name,
+            return LLMToolResult(
+                toolUseID: use.id,
+                toolName: use.name,
                 content: "ERROR: \(error.localizedDescription)",
                 isError: true
             )
@@ -394,10 +441,6 @@ public actor AgentLoop {
 
     private func appendUserInput(_ text: String) {
         messages.append(.user(text))
-        // Anchor the user's first message into the immutable prefix so the
-        // original task description is never compacted away. This mirrors
-        // pi-coding-agent's `firstKeptEntryId` anchor: subsequent compactions
-        // operate strictly on messages after this point.
         if !firstUserMessageAnchored {
             firstUserMessageAnchored = true
             immutablePrefixCount = messages.count
@@ -405,7 +448,7 @@ public actor AgentLoop {
         }
     }
 
-    private func recordUsage(_ usage: ModelUsage?) {
+    private func recordUsage(_ usage: LLMUsage?) {
         guard let usage, let input = usage.inputTokens else { return }
         lastReportedInputTokens = input
     }
@@ -433,10 +476,6 @@ public actor AgentLoop {
               cutPoint.index > firstKeptMessageIndex,
               cutPoint.index - firstKeptMessageIndex >= cfg.minMessagesToCompact
         else {
-            // No safe cut available — usually means the recent tail itself
-            // exceeds keepRecentTokens. If repeated, force-drop the oldest
-            // turn so the loop can make progress instead of hammering the
-            // summariser indefinitely.
             return await registerCompactionFailure(reason: .noCutPoint)
         }
 
@@ -454,13 +493,14 @@ public actor AgentLoop {
 
         let newSummary: String
         do {
-            let result = try await summarizer.generate(
-                request: ModelRequest(
+            let result = try await summarizer.complete(
+                LLMRequest(
+                    model: summarizerModelName,
                     messages: [.user(summaryPrompt)],
                     tools: []
                 )
             )
-            newSummary = result.content.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            newSummary = result.message.text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         } catch {
             return await registerCompactionFailure(reason: .summarizerError)
         }
@@ -469,10 +509,6 @@ public actor AgentLoop {
             return await registerCompactionFailure(reason: .emptySummary)
         }
 
-        // Merge with the previous summary. If the combined length blows past
-        // the configured threshold, ask the summariser to consolidate the two
-        // into a single tighter summary instead of doing a character-suffix
-        // truncate (which would silently lose the older anchor).
         let consolidated = try await consolidateSummaryIfNeeded(
             old: compactionSummary,
             new: newSummary,
@@ -489,19 +525,14 @@ public actor AgentLoop {
         case noCutPoint, emptyContent, emptySummary, summarizerError
     }
 
-    /// Track repeated compaction failures and, after enough of them, drop the
-    /// oldest turn with a placeholder so the conversation can keep moving.
     private func registerCompactionFailure(reason: CompactionFailureReason) async -> Bool {
         consecutiveCompactionFailures += 1
         guard consecutiveCompactionFailures >= config.compaction.maxConsecutiveFailures else {
             return false
         }
 
-        // Find the next turn boundary after firstKeptMessageIndex and discard
-        // everything up to it, replacing with a synthetic placeholder.
         let dropTarget = nextTurnBoundary(after: firstKeptMessageIndex)
         guard let dropTo = dropTarget, dropTo > firstKeptMessageIndex else {
-            // Nothing safe to drop. Reset counter so we don't spin.
             consecutiveCompactionFailures = 0
             return false
         }
@@ -514,8 +545,6 @@ public actor AgentLoop {
         return true
     }
 
-    /// First user-message index strictly greater than `start`. Used as a safe
-    /// drop target — guarantees we never split a tool_use / tool_result pair.
     private func nextTurnBoundary(after start: Int) -> Int? {
         var i = start + 1
         while i < messages.count {
@@ -533,9 +562,6 @@ public actor AgentLoop {
         let merged = old.map { $0 + "\n\n---\n\n" + new } ?? new
         if merged.count <= threshold { return merged }
 
-        // Ask the summariser to fold both into one tighter summary, preserving
-        // the anchor / goal / decisions explicitly. If this call fails we keep
-        // the merged form (truncating from the end as a last resort).
         let prompt = """
         You are consolidating two compaction summaries into one tighter summary that fits future model contexts.
 
@@ -548,18 +574,19 @@ public actor AgentLoop {
         \(new)
         """
         do {
-            let result = try await summarizer.generate(
-                request: ModelRequest(messages: [.user(prompt)], tools: [])
+            let result = try await summarizer.complete(
+                LLMRequest(
+                    model: summarizerModelName,
+                    messages: [.user(prompt)],
+                    tools: []
+                )
             )
-            let consolidated = result.content.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            let consolidated = result.message.text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             if !consolidated.isEmpty { return consolidated }
         } catch {
             // Fall through to fallback truncate.
         }
 
-        // Fallback: keep the start of the merged summary (which contains the
-        // older anchors) plus the very end (most recent), explicitly marking
-        // the gap. This is a degraded but honest result.
         if merged.count <= threshold { return merged }
         let head = String(merged.prefix(threshold / 2))
         let tail = String(merged.suffix(threshold / 2))
@@ -580,17 +607,17 @@ public actor AgentLoop {
         )
     }
 
-    private func makeRequestMessages() -> [AgentMessage] {
-        var requestMessages: [AgentMessage] = []
+    private func makeRequestMessages() -> [LLMMessage] {
+        var requestMessages: [LLMMessage] = []
 
         if immutablePrefixCount > 0 {
             requestMessages.append(contentsOf: messages.prefix(immutablePrefixCount))
         }
 
-        // Inject the summary as a `user` message rather than `system`. Pi-style.
-        // Anthropic concatenates all `system` content into the top-level system
-        // field, which would conflate the summary with the actual system prompt
-        // and may change model behaviour. A user-role wrapper avoids that.
+        // Inject the summary as a `user` message rather than `system` so it
+        // doesn't get conflated with the actual system prompt by providers
+        // that concatenate all system content into one top-level field
+        // (Anthropic).
         if let compactionSummary,
            !compactionSummary.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty
         {
@@ -606,45 +633,47 @@ public actor AgentLoop {
         return requestMessages
     }
 
-    private func makeRequestTools() async -> [ModelToolSpec] {
+    private func makeRequestTools() async -> [LLMToolSpec] {
         await toolRegistry.allSpecs().sorted { $0.name < $1.name }
     }
 
     /// Total token weight of a single message, counting every payload field.
-    /// Used by both the trigger check and the cut-point search so the two
-    /// agree on how big the conversation is.
-    private func messageWeight(_ message: AgentMessage) -> Int {
-        var size = TokenEstimator.estimate(message.text)
-        for call in message.toolCalls {
-            size += TokenEstimator.estimate(call.argumentsJSON)
-        }
-        for result in message.toolResults {
-            size += TokenEstimator.estimate(result.content)
+    private func messageWeight(_ message: LLMMessage) -> Int {
+        var size = 0
+        for block in message.content {
+            switch block {
+            case .text(let s):
+                size += TokenEstimator.estimate(s)
+            case .reasoning(let r):
+                size += TokenEstimator.estimate(r.text)
+                if let sig = r.signature { size += TokenEstimator.estimate(sig) }
+                if let enc = r.encryptedContent { size += TokenEstimator.estimate(enc) }
+            case .toolUse(let use):
+                size += TokenEstimator.estimate(use.argumentsJSON)
+                size += TokenEstimator.estimate(use.name)
+            case .toolResult(let result):
+                size += TokenEstimator.estimate(result.content)
+            case .image:
+                size += 256 // rough: image block uses a fixed slot in most providers
+            case .refusal(let s):
+                size += TokenEstimator.estimate(s)
+            }
         }
         return size + 12  // envelope estimate
     }
 
-    private func estimateTokens(messages: [AgentMessage]) -> Int {
+    private func estimateTokens(messages: [LLMMessage]) -> Int {
         messages.reduce(0) { $0 + messageWeight($1) }
     }
 
-    /// Tokens currently being sent to the model. Prefer the model's own usage
-    /// reporting (exact, post-cache) over our heuristic when available.
     private func currentUsedTokens() -> Int {
         if let reported = lastReportedInputTokens { return reported }
         return estimateTokens(messages: makeRequestMessages())
     }
 
-    /// Cut points are strictly at user-message boundaries. We never split a
-    /// turn (which would orphan a `tool_use` from its `tool_result` and crash
-    /// the next request). If no boundary lies between the immutable prefix
-    /// and the recent tail, we return nil and the caller falls back to the
-    /// failure path.
     private func findCutPoint(keepRecentTokens: Int) -> CutPoint? {
         guard firstKeptMessageIndex < messages.count else { return nil }
 
-        // Walk backwards summing message weight until we have enough recent
-        // history pinned. The cut point is everything older than this.
         var acc = 0
         var idx = messages.count - 1
         while idx >= firstKeptMessageIndex {
@@ -653,7 +682,6 @@ public actor AgentLoop {
             idx -= 1
         }
 
-        // Snap the cut to the nearest user-message boundary at or before idx.
         var candidate = idx
         while candidate > firstKeptMessageIndex, messages[candidate].role != .user {
             candidate -= 1
@@ -668,7 +696,7 @@ public actor AgentLoop {
         return CutPoint(index: candidate)
     }
 
-    private func serializeForSummary(messages: [AgentMessage]) -> String {
+    private func serializeForSummary(messages: [LLMMessage]) -> String {
         messages.map { message in
             switch message.role {
             case .system:
@@ -677,11 +705,12 @@ public actor AgentLoop {
                 return "[User] \(message.text)"
             case .assistant:
                 var parts: [String] = []
-                if !message.text.isEmpty {
-                    parts.append("[Assistant] \(message.text)")
+                let text = message.text
+                if !text.isEmpty {
+                    parts.append("[Assistant] \(text)")
                 }
-                for call in message.toolCalls {
-                    parts.append("[Assistant ToolCall: \(call.name)] args=\(call.argumentsJSON)")
+                for use in message.toolUses {
+                    parts.append("[Assistant ToolCall: \(use.name)] args=\(use.argumentsJSON)")
                 }
                 return parts.joined(separator: "\n")
             case .tool:

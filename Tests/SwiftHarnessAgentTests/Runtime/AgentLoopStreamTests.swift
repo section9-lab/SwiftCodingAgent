@@ -2,56 +2,10 @@ import Testing
 @testable import SwiftHarnessAgent
 import Foundation
 
-struct SSEParserTests {
-    @Test
-    func splitsEventsOnBlankLines() {
-        var parser = SSEParser()
-        let events = parser.feed("data: {\"a\":1}\n\ndata: {\"b\":2}\n\n")
-        #expect(events == [#"{"a":1}"#, #"{"b":2}"#])
-    }
+// MARK: - Streaming mock client
 
-    @Test
-    func handlesPartialChunks() {
-        var parser = SSEParser()
-        var events = parser.feed("data: {\"hel")
-        #expect(events.isEmpty)
-        events = parser.feed("lo\":1}\n\n")
-        #expect(events == [#"{"hello":1}"#])
-    }
-
-    @Test
-    func joinsMultipleDataLines() {
-        var parser = SSEParser()
-        let events = parser.feed("data: line1\ndata: line2\n\n")
-        #expect(events == ["line1\nline2"])
-    }
-
-    @Test
-    func ignoresCommentsAndOtherFields() {
-        var parser = SSEParser()
-        let events = parser.feed(": keep-alive\nevent: ping\nid: 1\ndata: ok\n\n")
-        #expect(events == ["ok"])
-    }
-
-    @Test
-    func handlesCRLF() {
-        var parser = SSEParser()
-        let events = parser.feed("data: hi\r\n\r\n")
-        #expect(events == ["hi"])
-    }
-
-    @Test
-    func passesThroughDoneSentinel() {
-        var parser = SSEParser()
-        let events = parser.feed("data: [DONE]\n\n")
-        #expect(events == ["[DONE]"])
-    }
-}
-
-// MARK: - Stream-aware mock model
-
-private struct StreamingMockModel: AgentModel {
-    let scripts: [[ModelStreamEvent]]
+private struct StreamingMockClient: LLMClient {
+    let scripts: [[LLMStreamEvent]]
     let cursor = ScriptCursor()
 
     actor ScriptCursor {
@@ -59,30 +13,31 @@ private struct StreamingMockModel: AgentModel {
         func next() -> Int { defer { index += 1 }; return index }
     }
 
-    func generate(request: ModelRequest) async throws -> ModelResponse {
-        // Walk this turn's script and synthesise a non-streaming response.
+    func complete(_ request: LLMRequest) async throws -> LLMResponse {
         let i = await cursor.next()
-        let script = i < scripts.count ? scripts[i] : [.completed(ModelResponse(content: "done"))]
-        var text = ""
-        var calls: [ToolCall] = []
+        let script = i < scripts.count ? scripts[i] : [.messageStop(LLMResponse(
+            message: LLMMessage(role: .assistant, content: [.text("done")]),
+            stopReason: .endTurn
+        ))]
         for event in script {
-            switch event {
-            case .textDelta(let s): text += s
-            case .reasoningDelta: break  // not surfaced in non-streaming response
-            case .toolCall(let c): calls.append(c)
-            case .completed(let r):
-                if text.isEmpty { text = r.content }
-                if calls.isEmpty { calls = r.toolCalls }
+            if case .messageStop(let response) = event {
+                return response
             }
         }
-        return ModelResponse(content: text, toolCalls: calls)
+        return LLMResponse(
+            message: LLMMessage(role: .assistant, content: [.text("done")]),
+            stopReason: .endTurn
+        )
     }
 
-    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelStreamEvent, Error> {
+    func stream(_ request: LLMRequest) -> AsyncThrowingStream<LLMStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 let i = await cursor.next()
-                let script = i < scripts.count ? scripts[i] : [.completed(ModelResponse(content: "done"))]
+                let script = i < scripts.count ? scripts[i] : [.messageStop(LLMResponse(
+                    message: LLMMessage(role: .assistant, content: [.text("done")]),
+                    stopReason: .endTurn
+                ))]
                 for event in script {
                     continuation.yield(event)
                 }
@@ -93,20 +48,43 @@ private struct StreamingMockModel: AgentModel {
     }
 }
 
+// MARK: - Helpers
+
+private func textStop(_ text: String) -> LLMStreamEvent {
+    .messageStop(LLMResponse(
+        message: LLMMessage(role: .assistant, content: [.text(text)]),
+        stopReason: .endTurn
+    ))
+}
+
+private func toolUseStop(_ text: String, uses: [LLMToolUse]) -> LLMStreamEvent {
+    var content: [LLMContentBlock] = []
+    if !text.isEmpty { content.append(.text(text)) }
+    for use in uses { content.append(.toolUse(use)) }
+    return .messageStop(LLMResponse(
+        message: LLMMessage(role: .assistant, content: content),
+        stopReason: .toolUse
+    ))
+}
+
 struct AgentLoopStreamTests {
     @Test
     func textDeltasAreForwardedThenCompletes() async throws {
-        let model = StreamingMockModel(scripts: [
+        let client = StreamingMockClient(scripts: [
             [
+                .messageStart(LLMStreamMessageStart(providerResponseID: nil)),
+                .blockStart(LLMStreamBlockStart(blockIndex: 0, kind: .text)),
                 .textDelta("Hel"),
                 .textDelta("lo, "),
                 .textDelta("world"),
-                .completed(ModelResponse(content: "Hello, world"))
+                .blockStop(LLMStreamBlockStop(blockIndex: 0)),
+                textStop("Hello, world")
             ]
         ])
 
         let loop = AgentLoop(
-            model: model,
+            client: client,
+            modelName: "mock",
             config: AgentLoopConfig(workingDirectory: URL(fileURLWithPath: "/tmp"))
         )
 
@@ -116,9 +94,9 @@ struct AgentLoopStreamTests {
         for try await event in loop.runStream(userInput: "hi") {
             switch event {
             case .textDelta(let s): deltas.append(s)
-            case .assistantTurn(let text, let calls):
+            case .assistantTurn(let text, let uses):
                 sawAssistantTurn = true
-                #expect(calls.isEmpty)
+                #expect(uses.isEmpty)
                 #expect(text == "Hello, world")
             case .completed(let result): finalText = result.finalText
             default: break
@@ -132,22 +110,20 @@ struct AgentLoopStreamTests {
 
     @Test
     func toolCallsArriveAsBatchedEvents() async throws {
-        let model = StreamingMockModel(scripts: [
+        let toolUses = [
+            LLMToolUse(id: "1", name: "read", argumentsJSON: #"{"path":"a"}"#),
+            LLMToolUse(id: "2", name: "read", argumentsJSON: #"{"path":"b"}"#)
+        ]
+        let client = StreamingMockClient(scripts: [
             [
+                .messageStart(LLMStreamMessageStart(providerResponseID: nil)),
+                .blockStart(LLMStreamBlockStart(blockIndex: 0, kind: .text)),
                 .textDelta("Looking up files"),
-                .toolCall(ToolCall(id: "1", name: "read", argumentsJSON: #"{"path":"a"}"#)),
-                .toolCall(ToolCall(id: "2", name: "read", argumentsJSON: #"{"path":"b"}"#)),
-                .completed(ModelResponse(
-                    content: "Looking up files",
-                    toolCalls: [
-                        ToolCall(id: "1", name: "read", argumentsJSON: #"{"path":"a"}"#),
-                        ToolCall(id: "2", name: "read", argumentsJSON: #"{"path":"b"}"#)
-                    ]
-                ))
+                .blockStop(LLMStreamBlockStop(blockIndex: 0)),
+                toolUseStop("Looking up files", uses: toolUses)
             ],
             [
-                .textDelta("Done"),
-                .completed(ModelResponse(content: "Done"))
+                textStop("Done")
             ]
         ])
 
@@ -161,7 +137,8 @@ struct AgentLoopStreamTests {
         }
 
         let loop = AgentLoop(
-            model: model,
+            client: client,
+            modelName: "mock",
             tools: [DummyTool()],
             config: AgentLoopConfig(workingDirectory: URL(fileURLWithPath: "/tmp"))
         )
