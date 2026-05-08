@@ -24,6 +24,8 @@ public struct AnthropicMessagesClient: LLMClient {
     /// Enable extended thinking with this token budget (0 = disabled).
     public let thinkingBudgetTokens: Int
 
+    private let transport = HTTPTransport(providerName: "Anthropic Messages")
+
     public init(
         baseURL: URL = URL(string: "https://api.anthropic.com/v1")!,
         apiKey: String?,
@@ -44,8 +46,7 @@ public struct AnthropicMessagesClient: LLMClient {
 
     public func complete(_ request: LLMRequest) async throws -> LLMResponse {
         let urlRequest = try makeURLRequest(for: request, stream: false)
-        let (data, response) = try await URLSession.shared.data(for: urlRequest)
-        try Self.checkStatus(response: response, data: data)
+        let data = try await transport.send(urlRequest)
         return try parseResponse(data)
     }
 
@@ -69,8 +70,7 @@ public struct AnthropicMessagesClient: LLMClient {
         continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation
     ) async throws {
         let urlRequest = try makeURLRequest(for: request, stream: true)
-        let (bytes, response) = try await URLSession.shared.bytes(for: urlRequest)
-        try await Self.checkStatusStreaming(response: response, bytes: bytes)
+        let bytes = try await transport.sendStreaming(urlRequest)
 
         var parser = SSEParser()
         struct Block {
@@ -255,20 +255,17 @@ public struct AnthropicMessagesClient: LLMClient {
     // MARK: - Request encoding
 
     private func makeURLRequest(for request: LLMRequest, stream: Bool) throws -> URLRequest {
-        let url = baseURL.appendingPathComponent("messages")
-        var urlRequest = URLRequest(url: url)
-        urlRequest.httpMethod = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if stream {
-            urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        }
-        urlRequest.setValue(anthropicVersion, forHTTPHeaderField: "anthropic-version")
+        var headers: [String: String] = ["anthropic-version": anthropicVersion]
         if let apiKey, !apiKey.isEmpty {
-            urlRequest.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            headers["x-api-key"] = apiKey
         }
-        urlRequest.timeoutInterval = timeout
-        urlRequest.httpBody = try makeRequestBody(from: request, stream: stream)
-        return urlRequest
+        return HTTPTransport.makeJSONRequest(
+            url: baseURL.appendingPathComponent("messages"),
+            body: try makeRequestBody(from: request, stream: stream),
+            headers: headers,
+            stream: stream,
+            timeout: timeout
+        )
     }
 
     func makeRequestBody(from request: LLMRequest, stream: Bool = false) throws -> Data {
@@ -506,39 +503,6 @@ public struct AnthropicMessagesClient: LLMClient {
         case "tool_use": return .toolUse
         case "stop_sequence": return .stopSequence
         case .some(let other): return .other(other)
-        }
-    }
-
-    private static func checkStatus(response: URLResponse, data: Data) throws {
-        guard let http = response as? HTTPURLResponse else {
-            throw LLMError.invalidResponse("Non-HTTP response")
-        }
-        guard (200...299).contains(http.statusCode) else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw LLMError.providerError(
-                httpStatus: http.statusCode,
-                message: "Anthropic Messages request failed",
-                body: body
-            )
-        }
-    }
-
-    private static func checkStatusStreaming(
-        response: URLResponse,
-        bytes: URLSession.AsyncBytes
-    ) async throws {
-        guard let http = response as? HTTPURLResponse else {
-            throw LLMError.invalidResponse("Non-HTTP response")
-        }
-        guard (200...299).contains(http.statusCode) else {
-            var collected = Data()
-            for try await byte in bytes { collected.append(byte) }
-            let body = String(data: collected, encoding: .utf8) ?? ""
-            throw LLMError.providerError(
-                httpStatus: http.statusCode,
-                message: "Anthropic Messages stream failed",
-                body: body
-            )
         }
     }
 }

@@ -21,6 +21,8 @@ public struct OpenAIChatCompletionsClient: LLMClient {
     /// Set to `false` for endpoints that 400 when `tools` appears.
     public let supportsTools: Bool
 
+    private let transport = HTTPTransport(providerName: "OpenAI Chat Completions")
+
     public init(
         baseURL: URL = URL(string: "https://api.openai.com/v1")!,
         apiKey: String?,
@@ -37,8 +39,7 @@ public struct OpenAIChatCompletionsClient: LLMClient {
 
     public func complete(_ request: LLMRequest) async throws -> LLMResponse {
         let urlRequest = try makeURLRequest(for: request, stream: false)
-        let (data, response) = try await URLSession.shared.data(for: urlRequest)
-        try Self.checkStatus(response: response, data: data)
+        let data = try await transport.send(urlRequest)
         return try parseResponse(data)
     }
 
@@ -62,8 +63,7 @@ public struct OpenAIChatCompletionsClient: LLMClient {
         continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation
     ) async throws {
         let urlRequest = try makeURLRequest(for: request, stream: true)
-        let (bytes, response) = try await URLSession.shared.bytes(for: urlRequest)
-        try await Self.checkStatusStreaming(response: response, bytes: bytes)
+        let bytes = try await transport.sendStreaming(urlRequest)
 
         // Tool-call deltas arrive indexed by position. We accumulate per
         // index and emit a single tool-use block (with all argument fragments
@@ -253,19 +253,17 @@ public struct OpenAIChatCompletionsClient: LLMClient {
     // MARK: - Request encoding
 
     private func makeURLRequest(for request: LLMRequest, stream: Bool) throws -> URLRequest {
-        let url = baseURL.appendingPathComponent("chat/completions")
-        var urlRequest = URLRequest(url: url)
-        urlRequest.httpMethod = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if stream {
-            urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        }
+        var headers: [String: String] = [:]
         if let apiKey, !apiKey.isEmpty {
-            urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            headers["Authorization"] = "Bearer \(apiKey)"
         }
-        urlRequest.timeoutInterval = timeout
-        urlRequest.httpBody = try makeRequestBody(from: request, stream: stream)
-        return urlRequest
+        return HTTPTransport.makeJSONRequest(
+            url: baseURL.appendingPathComponent("chat/completions"),
+            body: try makeRequestBody(from: request, stream: stream),
+            headers: headers,
+            stream: stream,
+            timeout: timeout
+        )
     }
 
     func makeRequestBody(from request: LLMRequest, stream: Bool = false) throws -> Data {
@@ -497,39 +495,6 @@ public struct OpenAIChatCompletionsClient: LLMClient {
         case "length": return .maxTokens
         case "tool_calls", "function_call": return .toolUse
         case .some(let other): return .other(other)
-        }
-    }
-
-    private static func checkStatus(response: URLResponse, data: Data) throws {
-        guard let http = response as? HTTPURLResponse else {
-            throw LLMError.invalidResponse("Non-HTTP response")
-        }
-        guard (200...299).contains(http.statusCode) else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw LLMError.providerError(
-                httpStatus: http.statusCode,
-                message: "OpenAI Chat Completions request failed",
-                body: body
-            )
-        }
-    }
-
-    private static func checkStatusStreaming(
-        response: URLResponse,
-        bytes: URLSession.AsyncBytes
-    ) async throws {
-        guard let http = response as? HTTPURLResponse else {
-            throw LLMError.invalidResponse("Non-HTTP response")
-        }
-        guard (200...299).contains(http.statusCode) else {
-            var collected = Data()
-            for try await byte in bytes { collected.append(byte) }
-            let body = String(data: collected, encoding: .utf8) ?? ""
-            throw LLMError.providerError(
-                httpStatus: http.statusCode,
-                message: "OpenAI Chat Completions stream failed",
-                body: body
-            )
         }
     }
 }
