@@ -50,6 +50,16 @@ public actor TodoStore {
         phases
     }
 
+    /// Replace the entire phase list from a host-supplied snapshot
+    /// (e.g. when restoring persisted todos from disk on session load).
+    /// Unlike the internal `replace(with:)`, this does not auto-promote a
+    /// pending task to in-progress — the snapshot is taken as authoritative.
+    /// Public so apps embedding the package can drive restore flows.
+    public func replaceExternal(_ newPhases: [TodoPhase]) {
+        phases = newPhases
+        broadcast()
+    }
+
     /// Async stream of phase snapshots. Emits the current state immediately,
     /// then a new snapshot on every mutation.
     public func phasesStream() -> AsyncStream<[TodoPhase]> {
