@@ -18,6 +18,7 @@ public actor AgentSDK {
         compaction: CompactionConfig = .init(),
         skillsDirectories: [URL] = [],
         approvalHandler: ToolApprovalHandler? = nil,
+        parallelToolCalls: Bool = false,
         todoStore: TodoStore? = nil,
         askHandler: AskHandler? = nil,
         taskCoordinator: TaskCoordinator? = nil
@@ -57,7 +58,8 @@ public actor AgentSDK {
                 executionPolicy: executionPolicy,
                 toolExecutionContexts: toolExecutionContexts,
                 compaction: compaction,
-                approvalHandler: approvalHandler
+                approvalHandler: approvalHandler,
+                parallelToolCalls: parallelToolCalls
             )
         )
     }
