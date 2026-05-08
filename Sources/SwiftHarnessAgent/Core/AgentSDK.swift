@@ -15,14 +15,26 @@ public actor AgentSDK {
         maxSteps: Int? = 8,
         compaction: CompactionConfig = .init(),
         skillsDirectories: [URL] = [],
-        approvalHandler: ToolApprovalHandler? = nil
+        approvalHandler: ToolApprovalHandler? = nil,
+        todoStore: TodoStore? = nil,
+        askHandler: AskHandler? = nil,
+        taskCoordinator: TaskCoordinator? = nil
     ) {
-        let builtinTools: [any AgentTool] = [
+        var builtinTools: [any AgentTool] = [
             ReadTool(),
             WriteTool(),
             EditTool(),
             BashTool()
         ]
+        if let todoStore {
+            builtinTools.append(TodoWriteTool(store: todoStore))
+        }
+        if let askHandler {
+            builtinTools.append(AskTool(handler: askHandler))
+        }
+        if let taskCoordinator {
+            builtinTools.append(TaskTool(coordinator: taskCoordinator))
+        }
 
         var allSkills: [any AgentSkill] = Array(skills)
         for dir in skillsDirectories {

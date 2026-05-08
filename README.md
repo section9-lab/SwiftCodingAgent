@@ -38,7 +38,7 @@ Build and run agents directly in Swift with `AgentSDK`, `AgentLoop`, and a small
 Plug in any backend that speaks the OpenAI Chat Completions format with `OpenAICompatibleChatModel`, talk to Anthropic directly with `AnthropicChatModel`, or use `EchoModel` for local testing.
 
 ### Built-in tool system
-The package includes `read`, `write`, `edit`, and `bash` tools, plus the `AgentTool` protocol for adding your own tools. `read` caps file size by default to keep tool output from blowing past the model's context window. `bash` is macOS-only (uses `sandbox-exec`); on other platforms it raises an explicit error.
+The package includes `read`, `write`, `edit`, and `bash` tools, plus the `AgentTool` protocol for adding your own tools. `read` caps file size by default to keep tool output from blowing past the model's context window. `bash` is macOS-only (uses `sandbox-exec`); on other platforms it raises an explicit error. Beyond the basics, opt-in productivity tools mirror the patterns from oh-my-pi: `todo_write` for phased task tracking, `ask` for interactive user prompts, and `task` for parallel subagent fan-out.
 
 ### Explicit execution boundaries
 File access and shell execution are controlled through `ToolExecutionPolicy`, so apps can decide exactly what an agent is allowed to touch.
@@ -169,6 +169,91 @@ That gives app developers a straightforward way to keep agent power inside clear
 
 ### Compaction
 Use `CompactionConfig` when you need the agent to handle longer histories without sending the full conversation every time.
+
+## Productivity Tools
+
+Three opt-in tools mirror the corresponding pieces of oh-my-pi's coding agent. Each is enabled by passing its dependency to `AgentSDK`; otherwise it stays off and is not advertised to the model.
+
+### Todo (`todo_write`)
+
+`TodoStore` holds a phased task list; `TodoWriteTool` mutates it through ordered ops (`init`, `start`, `done`, `drop`, `rm`, `append`, `note`). The first pending task is auto-promoted to `in_progress` after each completion. UI layers can subscribe to `TodoStore.phasesStream()` for live updates.
+
+```swift
+let todoStore = TodoStore()
+let agent = AgentSDK(
+    model: model,
+    workingDirectory: workspaceURL,
+    executionPolicy: ToolExecutionPolicy(workingDirectory: workspaceURL),
+    todoStore: todoStore
+)
+
+Task {
+    for await phases in await todoStore.phasesStream() {
+        // render to your UI
+        print("phases:", phases.map(\.name))
+    }
+}
+```
+
+### Ask (`ask`)
+
+`AskTool` lets the agent ask the user a clarifying question (or batch of related questions) during execution. The hosting app supplies an `AskHandler` closure that drives the actual prompt UI and returns the user's selections.
+
+```swift
+let askHandler: AskHandler = { questions in
+    // Render `questions` in your UI, collect responses, return one answer per question.
+    return questions.map { q in
+        AskAnswer(id: q.id, selections: [q.options[q.recommended ?? 0]])
+    }
+}
+
+let agent = AgentSDK(
+    model: model,
+    workingDirectory: workspaceURL,
+    executionPolicy: ToolExecutionPolicy(workingDirectory: workspaceURL),
+    askHandler: askHandler
+)
+```
+
+The tool is intentionally narrow: the model can ask only when multiple approaches have materially different tradeoffs the user must weigh.
+
+### Task (`task`) — Subagents
+
+`TaskTool` spawns one or more subagents in parallel through a `TaskCoordinator`. Each subagent is a stateless template (`SubagentDefinition`) describing a system prompt, allowed tools, optional skills, and a step ceiling. Tasks in a single `task` call all target the same agent id; they run concurrently up to `maxConcurrency`.
+
+```swift
+let explorer = SubagentDefinition(
+    id: "explore",
+    displayName: "Explorer",
+    description: "Read-only investigator that returns compressed context",
+    systemPrompt: "You are a read-only codebase scout. Return concise findings.",
+    tools: [ReadTool()],
+    maxSteps: 8
+)
+
+let coordinator = TaskCoordinator(
+    definitions: [explorer],
+    modelFactory: { _ in
+        OpenAICompatibleChatModel(
+            baseURL: URL(string: "https://api.openai.com/v1")!,
+            apiKey: ProcessInfo.processInfo.environment["OPENAI_API_KEY"],
+            modelName: "gpt-4o-mini"
+        )
+    },
+    workingDirectory: workspaceURL,
+    executionPolicy: ToolExecutionPolicy(workingDirectory: workspaceURL),
+    maxConcurrency: 4
+)
+
+let agent = AgentSDK(
+    model: model,
+    workingDirectory: workspaceURL,
+    executionPolicy: ToolExecutionPolicy(workingDirectory: workspaceURL),
+    taskCoordinator: coordinator
+)
+```
+
+Subagents inherit the parent's working directory and execution policy. Each task carries its own `assignment`; an optional `context` is shared across the batch. Failures in one task do not abort the rest — they are reported as `failed` results.
 
 ## Custom Tool Example
 
