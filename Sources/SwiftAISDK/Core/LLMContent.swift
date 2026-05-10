@@ -74,17 +74,24 @@ public struct LLMReasoning: Sendable {
     /// OpenAI Responses reasoning item id. Used to maintain ordering when
     /// rebuilding the input array on follow-up turns.
     public var id: String?
+    /// Anthropic `redacted_thinking` opaque blob. When set, this block was
+    /// produced by the safety classifier and the visible `text` is empty;
+    /// the encoder must emit `redacted_thinking` (not `thinking`) so the
+    /// blob round-trips intact on follow-up turns.
+    public var redactedData: String?
 
     public init(
         text: String,
         signature: String? = nil,
         encryptedContent: String? = nil,
-        id: String? = nil
+        id: String? = nil,
+        redactedData: String? = nil
     ) {
         self.text = text
         self.signature = signature
         self.encryptedContent = encryptedContent
         self.id = id
+        self.redactedData = redactedData
     }
 }
 

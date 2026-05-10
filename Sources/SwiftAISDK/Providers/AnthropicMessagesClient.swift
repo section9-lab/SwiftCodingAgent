@@ -81,6 +81,10 @@ public struct AnthropicMessagesClient: LLMClient {
             var argsJSON: String = ""
             var thinking: String = ""
             var signature: String?
+            /// Set for `redacted_thinking` blocks; the full opaque blob is
+            /// delivered in `content_block_start` (no deltas follow) and must
+            /// round-trip verbatim on the next request.
+            var redactedData: String?
         }
         var blocks: [Int: Block] = [:]
         var responseID: String?
@@ -88,8 +92,17 @@ public struct AnthropicMessagesClient: LLMClient {
         var usage: LLMUsage? = nil
         var emittedMessageStart = false
 
-        for try await line in bytes.lines {
-            let events = parser.feed(line + "\n")
+        // Iterate raw bytes rather than `bytes.lines` because
+        // `URLSession.AsyncBytes.lines` collapses consecutive line separators
+        // on some platforms — and SSE uses the blank line as the event
+        // terminator. Without it, SSEParser never emits an event.
+        var byteAccum: [UInt8] = []
+        for try await byte in bytes {
+            byteAccum.append(byte)
+            guard byte == 0x0A else { continue }
+            let chunk = String(decoding: byteAccum, as: UTF8.self)
+            byteAccum.removeAll(keepingCapacity: true)
+            let events = parser.feed(chunk)
             for payload in events {
                 guard let data = payload.data(using: .utf8),
                       let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -118,13 +131,18 @@ public struct AnthropicMessagesClient: LLMClient {
                         block.type = (cb["type"] as? String) ?? "text"
                         block.toolID = cb["id"] as? String
                         block.toolName = cb["name"] as? String
+                        // `redacted_thinking` arrives whole; its `data` is the
+                        // opaque blob we must echo back on the next turn.
+                        if block.type == "redacted_thinking" {
+                            block.redactedData = cb["data"] as? String
+                        }
                     }
                     blocks[index] = block
                     let kind: LLMStreamBlockStart.Kind
                     switch block.type {
                     case "tool_use":
                         kind = .toolUse(id: block.toolID ?? "", name: block.toolName ?? "")
-                    case "thinking":
+                    case "thinking", "redacted_thinking":
                         kind = .reasoning
                     case "text":
                         kind = .text
@@ -229,6 +247,11 @@ public struct AnthropicMessagesClient: LLMClient {
                         text: block.thinking,
                         signature: block.signature
                     ))
+                case "redacted_thinking":
+                    return .reasoning(LLMReasoning(
+                        text: "",
+                        redactedData: block.redactedData
+                    ))
                 case "tool_use":
                     guard let id = block.toolID, let name = block.toolName else { return nil }
                     return .toolUse(LLMToolUse(
@@ -280,13 +303,20 @@ public struct AnthropicMessagesClient: LLMClient {
             }
         }
 
+        let thinkingEnabled = thinkingBudgetTokens > 0
+
         var payload: [String: Any] = [
             "model": request.model,
             "max_tokens": request.maxOutputTokens ?? defaultMaxTokens,
             "messages": encodeMessages(conversational),
             "stream": stream
         ]
-        if let temperature = request.temperature {
+        // Anthropic rejects any temperature other than 1 when extended
+        // thinking is enabled. Honour the caller's value when thinking is
+        // off; force 1 (and ignore top_p / top_k) when it's on.
+        if thinkingEnabled {
+            payload["temperature"] = 1
+        } else if let temperature = request.temperature {
             payload["temperature"] = temperature
         }
         if !systemTexts.isEmpty {
@@ -298,7 +328,7 @@ public struct AnthropicMessagesClient: LLMClient {
                 payload["tool_choice"] = choice
             }
         }
-        if thinkingBudgetTokens > 0 {
+        if thinkingEnabled {
             payload["thinking"] = [
                 "type": "enabled",
                 "budget_tokens": thinkingBudgetTokens
@@ -342,14 +372,29 @@ public struct AnthropicMessagesClient: LLMClient {
                     // signature when threading thinking + tool use across
                     // turns. Skipping the reasoning text isn't enough — the
                     // signature is what the API validates.
-                    var dict: [String: Any] = [
-                        "type": "thinking",
-                        "thinking": reasoning.text
-                    ]
-                    if let sig = reasoning.signature {
-                        dict["signature"] = sig
+                    //
+                    // Three shapes possible:
+                    //   1. `redacted_thinking` — emitted as-is via its opaque
+                    //      `data` blob; no signature, no text.
+                    //   2. `thinking` with signature — round-tripped intact.
+                    //   3. `thinking` without signature — Anthropic rejects
+                    //      it with a missing-signature error, so drop the
+                    //      block instead of poisoning the request. This
+                    //      occurs when reasoning came from a non-Anthropic
+                    //      provider, or the signature was lost.
+                    if let redacted = reasoning.redactedData, !redacted.isEmpty {
+                        parts.append([
+                            "type": "redacted_thinking",
+                            "data": redacted
+                        ])
+                    } else if let sig = reasoning.signature, !sig.isEmpty {
+                        parts.append([
+                            "type": "thinking",
+                            "thinking": reasoning.text,
+                            "signature": sig
+                        ])
                     }
-                    parts.append(dict)
+                    // else: silently drop — see comment above.
                 case .text(let s):
                     if !s.isEmpty {
                         parts.append(["type": "text", "text": s])
@@ -461,6 +506,9 @@ public struct AnthropicMessagesClient: LLMClient {
                 let text = (block["thinking"] as? String) ?? ""
                 let signature = block["signature"] as? String
                 assembled.append(.reasoning(LLMReasoning(text: text, signature: signature)))
+            case "redacted_thinking":
+                let data = (block["data"] as? String) ?? ""
+                assembled.append(.reasoning(LLMReasoning(text: "", redactedData: data)))
             case "tool_use":
                 guard let id = block["id"] as? String,
                       let name = block["name"] as? String else { continue }

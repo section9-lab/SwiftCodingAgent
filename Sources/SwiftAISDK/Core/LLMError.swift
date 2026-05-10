@@ -16,7 +16,11 @@ public enum LLMError: LocalizedError {
         switch self {
         case .invalidResponse(let m):
             return "Invalid response: \(m)"
-        case .providerError(let status, let message, _):
+        case .providerError(let status, let message, let body):
+            if let body, !body.isEmpty {
+                let trimmed = body.count > 500 ? String(body.prefix(500)) + "…" : body
+                return "Provider error (\(status)): \(message) — \(trimmed)"
+            }
             return "Provider error (\(status)): \(message)"
         case .streamingProtocol(let m):
             return "Streaming protocol error: \(m)"
